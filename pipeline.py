@@ -71,6 +71,26 @@ ALPHA_SNAP_HIGH = 0.992
 # downscale pipeline tends to attenuate.
 ALPHA_LIFT_GAMMA = 0.80
 
+# Blend window between pymatting's decontaminated foreground colour and the
+# original image RGB, driven by α:
+#   α ≤ DECONTAM_BLEND_LO  → use pymatting's decontaminated colour
+#   α ≥ DECONTAM_BLEND_HI  → use the original RGB directly
+#   in between             → smoothstep blend
+# The decontamination pass smooths locally, which turns dense opaque hair
+# into a flat patch of average tone — losing the clump-level variation that
+# makes hair read as hair. At α ≳ 0.85 the background bleed is negligible
+# (≤ 15 % of the pixel's value), so the original image is already a better
+# estimate of the pure foreground colour than pymatting's smoothed output.
+DECONTAM_BLEND_LO = 0.85
+DECONTAM_BLEND_HI = 0.98
+
+# Detail-injection scale for mid-α pixels. The original unsharp-mask detail
+# is added on top of the base colour, gated so pure-background pixels don't
+# pick it up. Alpha-gated with a gentler curve (sqrt) than before so dense
+# hair keeps its texture instead of being muted to α× its real variation.
+DETAIL_INJECT_STRENGTH = 0.9
+DETAIL_GAUSSIAN_SIGMA = 8.0  # up from 5 — captures clump-level variation too
+
 # Supersampling factors — the matting model runs at 1024² internally.
 # Processing the input at >1× and Lanczos-downsampling the resulting RGBA
 # anti-aliases the stair-step artifacts from the model's mask upscaling.
@@ -663,46 +683,54 @@ def remove_background(
         alpha_matting_erode_size=erode_size,
     ).convert("RGBA")
 
-    # --- 3. high-pass detail injection ------------------------------------
-    # rembg's pymatting foreground-ML estimator smooths the foreground
-    # color locally → monotone wisps. We can't just reuse the raw original
-    # RGB (it still carries the old background colour on semi-transparent
-    # pixels) and manual per-pixel decontamination is numerically unstable
-    # at low α.
+    # --- 3. foreground colour: α-blended base + high-pass detail ----------
+    # pymatting's foreground-ML estimator solves for the *pure* foreground
+    # colour at each pixel, which is mandatory for semi-transparent hair
+    # wisps (where the original pixel is a mix of hair and old background).
+    # But the estimator smooths its output locally, so dense opaque hair
+    # loses its clump-level variation and reads as a flat patch.
     #
-    # Clean approach: use pymatting's decontaminated colour as the *base*
-    # (correct pure hair tone, free of bleach) and *add* the original's
-    # high-frequency detail on top. The detail is isolated with an
-    # unsharp-mask kernel:
+    # Two-part fix:
     #
-    #     detail = I_orig − GaussianBlur(I_orig, σ)
+    # (a) α-blended BASE COLOUR. At α ≈ 1 the original pixel already is
+    #     the pure foreground colour (the old bg contributes ≤ 2 %), so use
+    #     the original directly — no smoothing. Between DECONTAM_BLEND_LO
+    #     and DECONTAM_BLEND_HI we smoothstep-fade from decontaminated
+    #     (needed for semi-transparent edges) to original (safe for dense
+    #     opaque content). This recovers hair texture in the back without
+    #     reintroducing bg bleed at the wispy edges.
     #
-    # The Gaussian blur kills everything low-frequency — including the
-    # uniform old background, which is *by construction* the dominant
-    # low-frequency content of the image. What survives is local variation:
-    # individual hair strands, highlights, shadows. Adding that back on top
-    # of the decontaminated base gives natural colour variation without
-    # reintroducing background bleach.
-    #
-    # Weighted by α so pure-background pixels (α=0) get no detail added.
+    # (b) UNSHARP-MASK DETAIL INJECTION on top. σ = DETAIL_GAUSSIAN_SIGMA
+    #     isolates everything from strand-level (1–2 px) up to clump-level
+    #     (~16 px) variation. Added weighted by √α so mid-α hair gets most
+    #     of its texture back instead of being muted to α× its real signal,
+    #     while α=0 pixels still stay clean.
     out_arr = np.array(out, dtype=np.uint8)
     alpha_f = out_arr[..., 3:4].astype(np.float32) / 255.0
 
     orig_rgb_f = rgb.astype(np.float32)
     decontam_rgb_f = out_arr[..., :3].astype(np.float32)
 
-    # Unsharp mask on the ORIGINAL: high-frequency detail, background-safe.
+    # Smoothstep blend between decontaminated and original, driven by α.
+    lo, hi = DECONTAM_BLEND_LO, DECONTAM_BLEND_HI
+    t = np.clip((alpha_f - lo) / (hi - lo), 0.0, 1.0)
+    blend_w = t * t * (3.0 - 2.0 * t)  # smoothstep → 0..1
+    base_rgb_f = decontam_rgb_f * (1.0 - blend_w) + orig_rgb_f * blend_w
+
+    # Unsharp mask on the ORIGINAL: local variation, background-safe because
+    # the uniform old bg is (by construction) the dominant low-frequency
+    # content that the Gaussian removes.
     blur = cv2.GaussianBlur(
-        orig_rgb_f, ksize=(0, 0), sigmaX=5.0, sigmaY=5.0
+        orig_rgb_f, ksize=(0, 0),
+        sigmaX=DETAIL_GAUSSIAN_SIGMA, sigmaY=DETAIL_GAUSSIAN_SIGMA,
     )
     detail = orig_rgb_f - blur  # ∈ [-~80, +~80] practically
 
-    # Scale the detail by α so wisps with α≈0 don't get detail added (those
-    # pixels are invisible anyway but avoiding the addition keeps the image
-    # array numerically clean). Strength=0.9 reintroduces most of the
-    # variation without amplifying noise.
-    detail_strength = 0.9
-    enriched = decontam_rgb_f + detail * alpha_f * detail_strength
+    # √α gating: at α=1 full detail, at α=0.25 still 50 % detail, at α=0
+    # exactly zero. Much gentler than the old linear-α gating that muted
+    # mid-α hair to its own α-fraction.
+    detail_gain = np.sqrt(np.clip(alpha_f, 0.0, 1.0)) * DETAIL_INJECT_STRENGTH
+    enriched = base_rgb_f + detail * detail_gain
 
     # --- 3b. α gamma-lift: rescue faint wisps -----------------------------
     # The model runs at 1024² internally; wisps thinner than ~2 model pixels
