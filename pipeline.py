@@ -4,11 +4,17 @@ Local, GDPR-safe batch processor.
 
 Pipeline (per image):
     1. Face detection (Mediapipe, CPU)
-    2. Smart square crop + resize (≤ 2048 px, LANCZOS)
-    3. Background removal (rembg / u2net, alpha matting ON)
-    4. Save <name>_nobg.png (RGBA)
-    5. For each background: fit + alpha-composite
-    6. Save <name>_bg_<bgname>.jpg (RGB, q=95)
+    2. Frame at the input's native aspect ratio, minimally cropped with face
+       at FACE_TOP_RATIO from top (≤ MAX_SIDE on longest side, LANCZOS)
+    3. Background removal (rembg, alpha matting ON) → "standard-AR" RGBA
+    4. Re-crop the RGBA to 1:1 and save <name>_nobg.png (archival)
+    5. For each background:
+        · re-crop the RGBA to the background's aspect ratio
+        · cover-fit the background under it
+        · save <name>_bg_<bgname>_<WxH>.jpg (RGB, q=95)
+
+The background removal runs *once* per input at the native aspect ratio;
+each output composite is a cheap re-crop + alpha-compose, not a re-matting.
 
 NOTE: heavy dependencies (cv2, mediapipe, rembg, PIL) are imported lazily
 inside the functions that need them so the Streamlit app can render
@@ -22,6 +28,7 @@ import io
 import platform
 import time
 from dataclasses import dataclass, field
+from fractions import Fraction
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
@@ -67,7 +74,8 @@ SUPERSAMPLE_HIGH_QUALITY = 1.5  # stronger AA, noticeable slowdown
 # no intermediate feedback, which looks to the user like a hang.
 MAX_WORK_SIDE = 2560
 
-PORTRAIT_FACE_TOP_RATIO = 0.30  # face at ~30% from top of square for portraits
+FACE_TOP_RATIO = 0.30  # face vertical position in crop (from top), universal
+PORTRAIT_FACE_TOP_RATIO = FACE_TOP_RATIO  # backward-compat alias
 
 # ---------------------------------------------------------------------------
 # Models
@@ -303,29 +311,143 @@ def detect_face_center(image_bgr) -> Tuple[int, int, bool]:
 # ---------------------------------------------------------------------------
 # Step 2 — smart square crop
 # ---------------------------------------------------------------------------
-def smart_square_crop(image_bgr, face_x: int, face_y: int):
+def smart_crop_to_ar(
+    image_bgr,
+    face_x: int,
+    face_y: int,
+    target_ar: float,
+    face_top_ratio: float = FACE_TOP_RATIO,
+    max_side: int = MAX_SIDE,
+) -> Tuple["object", Tuple[int, int]]:
+    """
+    Crop ``image_bgr`` to aspect ratio ``target_ar`` (= width/height), with the
+    face horizontally centered and placed at ``face_top_ratio`` from the top.
+
+    Picks the largest possible crop that satisfies the AR and face-position
+    constraints, then clamps the origin to the image bounds (so a face near
+    an edge still produces a valid crop, just with the face slightly off the
+    ideal 30 %).
+
+    Longest side is capped to ``max_side`` via Lanczos downscale so downstream
+    matting doesn't stall on 50 MP inputs.
+
+    Returns ``(crop_bgr, (face_x_in_crop, face_y_in_crop))``.
+    """
     import cv2
     h, w = image_bgr.shape[:2]
-    L = min(w, h)
+    fty = face_top_ratio
 
-    if w >= h:
-        # Landscape (or square): crop width, keep height; center on face_x
-        x0 = int(face_x - L / 2)
-        x0 = max(0, min(w - L, x0))
-        y0 = 0
-    else:
-        # Portrait: crop height, keep width; face at ~30% from top
-        y0 = int(face_y - L * PORTRAIT_FACE_TOP_RATIO)
-        y0 = max(0, min(h - L, y0))
-        x0 = 0
+    # Largest (cw, ch) with cw/ch = target_ar and face at (cw/2, fty*ch):
+    #   cx = face_x - cw/2    — requires cx >= 0  →  cw <= 2*face_x
+    #                         — requires cx+cw <= w  →  cw <= 2*(w-face_x)
+    #   cy = face_y - fty*ch  — requires cy >= 0  →  ch <= face_y / fty
+    #                         — requires cy+ch <= h  →  ch <= (h-face_y)/(1-fty)
+    ch_max = min(
+        float(h),
+        face_y / fty if fty > 0 else float("inf"),
+        (h - face_y) / (1 - fty) if fty < 1 else float("inf"),
+        (2 * face_x) / target_ar if target_ar > 0 else float("inf"),
+        (2 * (w - face_x)) / target_ar if target_ar > 0 else float("inf"),
+        w / target_ar if target_ar > 0 else float("inf"),
+    )
+    ch = max(1.0, ch_max)
+    cw = ch * target_ar
 
-    crop = image_bgr[y0 : y0 + L, x0 : x0 + L]
+    cx = face_x - cw / 2
+    cy = face_y - fty * ch
 
-    if L > MAX_SIDE:
-        crop = cv2.resize(
-            crop, (MAX_SIDE, MAX_SIDE), interpolation=cv2.INTER_LANCZOS4
-        )
+    # Clamp defensively — upstream math should already keep us in bounds, but
+    # rounding can push one pixel over.
+    cx = max(0.0, min(float(w) - cw, cx))
+    cy = max(0.0, min(float(h) - ch, cy))
+
+    x0, y0 = int(round(cx)), int(round(cy))
+    cw_i, ch_i = int(round(cw)), int(round(ch))
+    x1, y1 = min(w, x0 + cw_i), min(h, y0 + ch_i)
+    crop = image_bgr[y0:y1, x0:x1]
+
+    # Downscale if the longest side exceeds max_side.
+    out_fx = face_x - x0
+    out_fy = face_y - y0
+    crop_h, crop_w = crop.shape[:2]
+    longest = max(crop_w, crop_h)
+    if longest > max_side:
+        scale = max_side / longest
+        new_w = int(round(crop_w * scale))
+        new_h = int(round(crop_h * scale))
+        crop = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+        out_fx = int(round(out_fx * scale))
+        out_fy = int(round(out_fy * scale))
+
+    return crop, (int(out_fx), int(out_fy))
+
+
+def smart_square_crop(image_bgr, face_x: int, face_y: int):
+    """Legacy 1:1 crop, kept for backward compatibility. Prefer
+    ``smart_crop_to_ar`` which supports arbitrary aspect ratios."""
+    crop, _ = smart_crop_to_ar(image_bgr, face_x, face_y, 1.0)
     return crop
+
+
+def crop_rgba_to_ar(
+    subject_rgba,
+    face_x: int,
+    face_y: int,
+    target_ar: float,
+    face_top_ratio: float = FACE_TOP_RATIO,
+):
+    """
+    Re-crop an already-matted RGBA subject to ``target_ar``, keeping the face
+    at ``(new_W/2, face_top_ratio * new_H)``.
+
+    Used for:
+      · the 1:1 archival PNG (``target_ar = 1.0``)
+      · each per-background composite (``target_ar = bg_w / bg_h``)
+
+    If an edge is hit (rare, happens when the face is close to the border of
+    the native-AR standard frame), the crop clamps to the image bounds and
+    accepts a small deviation in face position rather than upscaling.
+    """
+    from PIL import Image  # noqa: F401 — just to ensure import is sane
+    w, h = subject_rgba.size
+    fty = face_top_ratio
+
+    ch_max = min(
+        float(h),
+        face_y / fty if fty > 0 else float("inf"),
+        (h - face_y) / (1 - fty) if fty < 1 else float("inf"),
+        (2 * face_x) / target_ar if target_ar > 0 else float("inf"),
+        (2 * (w - face_x)) / target_ar if target_ar > 0 else float("inf"),
+        w / target_ar if target_ar > 0 else float("inf"),
+    )
+    ch = max(1.0, ch_max)
+    cw = ch * target_ar
+
+    cx = face_x - cw / 2
+    cy = face_y - fty * ch
+
+    cx = max(0.0, min(float(w) - cw, cx))
+    cy = max(0.0, min(float(h) - ch, cy))
+
+    x0, y0 = int(round(cx)), int(round(cy))
+    x1 = min(w, x0 + int(round(cw)))
+    y1 = min(h, y0 + int(round(ch)))
+    return subject_rgba.crop((x0, y0, x1, y1))
+
+
+def ar_label(width: int, height: int, max_denom: int = 20) -> str:
+    """
+    Produce a human-readable aspect-ratio tag like ``"16x9"`` or ``"3x2"``.
+
+    Snaps to the closest fraction with denominator ≤ ``max_denom`` so odd
+    sensor sizes (3024×4032, 1920×1081) collapse to the canonical tag
+    (``3x4``, ``16x9``) instead of leaking raw pixel dimensions into the
+    filename.
+    """
+    if width <= 0 or height <= 0:
+        return "na"
+    frac = Fraction(width, height).limit_denominator(max_denom)
+    return f"{frac.numerator}x{frac.denominator}"
 
 
 # ---------------------------------------------------------------------------
@@ -565,14 +687,21 @@ def process_batch(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Preload backgrounds once — reused for every subject.
-    bg_pils: List[Tuple[str, "Image.Image"]] = []
+    # Preload backgrounds once — reused for every subject. For each background
+    # we also precompute its aspect ratio and canonical AR label (e.g. "16x9")
+    # so the per-subject composite stage only does cropping + compositing.
+    bg_items: List[Tuple[str, "Image.Image", float, str]] = []
     bg_errors: List[str] = []
     for name, data in backgrounds:
         try:
             img = Image.open(io.BytesIO(data))
             img.load()
-            bg_pils.append((Path(name).stem, img))
+            bw, bh = img.size
+            if bw <= 0 or bh <= 0:
+                raise ValueError("zero-size image")
+            bg_ar = bw / bh
+            label = ar_label(bw, bh)
+            bg_items.append((Path(name).stem, img, bg_ar, label))
         except Exception as e:  # noqa: BLE001
             bg_errors.append(f"background '{name}' unreadable: {e}")
 
@@ -602,26 +731,45 @@ def process_batch(
             fx, fy, detected = detect_face_center(raw)
             stage_times["face"] = time.perf_counter() - t0
 
+            # Frame at the input's NATIVE aspect ratio (minimally cropped to
+            # place the face at FACE_TOP_RATIO from top). This is the "standard
+            # frame" on which background removal runs — one matting pass, then
+            # every output re-crops the resulting RGBA to its own target AR.
             t0 = time.perf_counter()
-            squared = smart_square_crop(raw, fx, fy)
+            raw_h, raw_w = raw.shape[:2]
+            native_ar = raw_w / raw_h if raw_h else 1.0
+            framed, (face_in_crop_x, face_in_crop_y) = smart_crop_to_ar(
+                raw, fx, fy, native_ar
+            )
             stage_times["crop"] = time.perf_counter() - t0
 
             t0 = time.perf_counter()
             subject = remove_background(
-                squared, model_name=model_name, supersample=supersample
+                framed, model_name=model_name, supersample=supersample
             )
             stage_times["matting"] = time.perf_counter() - t0
 
+            # Archival 1:1 PNG — a re-crop of the standard-AR RGBA centered on
+            # the face. Same role as before; no re-matting.
             t0 = time.perf_counter()
+            nobg_crop = crop_rgba_to_ar(
+                subject, face_in_crop_x, face_in_crop_y, 1.0
+            )
             nobg_name = f"{img_path.stem}_nobg.png"
-            subject.save(output_dir / nobg_name, format="PNG", optimize=True)
+            nobg_crop.save(output_dir / nobg_name, format="PNG", optimize=True)
             produced.append(nobg_name)
             stage_times["save_png"] = time.perf_counter() - t0
 
+            # Per-background composites: each output takes on its background's
+            # aspect ratio. Filename carries the AR tag (e.g. "_16x9") so you
+            # can tell variants apart at a glance.
             t0 = time.perf_counter()
-            for bg_name, bg_pil in bg_pils:
-                composed = composite_on_background(subject, bg_pil)
-                out_name = f"{img_path.stem}_bg_{bg_name}.jpg"
+            for bg_name, bg_pil, bg_ar, bg_ar_tag in bg_items:
+                subject_for_bg = crop_rgba_to_ar(
+                    subject, face_in_crop_x, face_in_crop_y, bg_ar
+                )
+                composed = composite_on_background(subject_for_bg, bg_pil)
+                out_name = f"{img_path.stem}_bg_{bg_name}_{bg_ar_tag}.jpg"
                 composed.save(
                     output_dir / out_name,
                     format="JPEG",

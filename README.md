@@ -33,11 +33,11 @@ Built for the Mu Nu chapter of IEEE-HKN at Politecnico di Torino.
 When a new associate cohort comes in, someone has to process dozens of portrait photos: crop them consistently, strip the background, and drop each face onto the chapter background. This tool automates that in six deterministic steps:
 
 1. **Detect** — Mediapipe locates the face in the image. OpenCV Haar cascade kicks in automatically if Mediapipe isn't available for the running Python version.
-2. **Frame** — The image gets cropped to a square. For landscape shots the crop centers on the face horizontally. For portrait shots the face sits 30% from the top, which is standard for ID-style portraits.
-3. **Isolate** — rembg strips the background (ISNet or BiRefNet depending on quality setting) with alpha matting enabled. The matting trimap is intentionally wide so the solver has enough room to produce continuous alpha values on frizzy and curly hair instead of a binary cutout.
-4. **Archive** — A transparent PNG (`_nobg.png`) is saved. Useful for later reuse without reprocessing.
-5. **Compose** — Each uploaded background gets cover-fit to the subject's size and alpha-composited underneath.
-6. **Publish** — Final RGB exports saved as JPEG at q=95, 4:4:4 chroma.
+2. **Frame** — The image is minimally cropped at its **native aspect ratio** so the face sits 30% from the top and is horizontally centered. No forced 1:1 here — the input's AR becomes the "standard frame" for this subject.
+3. **Isolate** — rembg strips the background (ISNet or BiRefNet depending on quality setting) with alpha matting enabled. The matting trimap is intentionally wide so the solver has enough room to produce continuous alpha values on frizzy and curly hair instead of a binary cutout. **This step runs exactly once per input**; every output below reuses the same RGBA.
+4. **Archive** — The standard-AR RGBA is re-cropped to 1:1 (face at 30% from top) and saved as `_nobg.png`. Useful for later reuse without reprocessing.
+5. **Compose** — For each uploaded background, the standard-AR RGBA is **re-cropped to the background's own aspect ratio** (face still at 30% from top), then the background is cover-fit underneath and alpha-composited. Output takes on the background's aspect ratio.
+6. **Publish** — Final RGB exports saved as JPEG at q=95, 4:4:4 chroma. The filename carries the AR tag: `photo_bg_studio_16x9.jpg`, `photo_bg_poster_2x3.jpg`.
 
 ---
 
@@ -99,16 +99,16 @@ The warm-up log shows which providers are active: `Metal / ANE` or `CPU only`.
 
 ## Output files
 
-For each input image `photo.jpg` with backgrounds `blue.png` and `white.jpg`:
+For each input image `photo.jpg` with a 16:9 `blue.png` and a 3:2 `white.jpg` background:
 
 ```
 output/
-  photo_nobg.png           # RGBA, transparent background
-  photo_bg_blue.jpg        # RGB, composited on blue
-  photo_bg_white.jpg       # RGB, composited on white
+  photo_nobg.png               # RGBA, 1:1 square archival, transparent background
+  photo_bg_blue_16x9.jpg       # RGB, composited on blue, 16:9 aspect
+  photo_bg_white_3x2.jpg       # RGB, composited on white, 3:2 aspect
 ```
 
-Output filenames come from the stem of the source file and the stem of the background file.
+The AR tag in the filename is the background's own aspect ratio, snapped to the nearest simple fraction (so `1920×1081` still collapses to `16x9`). The archival `_nobg.png` is always 1:1.
 
 ---
 
@@ -127,7 +127,7 @@ All the quality knobs are constants at the top of `pipeline.py`:
 | `ALPHA_MATTING_ERODE` | 30 | Trimap erosion size (px at output resolution) |
 | `ALPHA_LIFT_GAMMA` | 0.80 | Gamma applied to alpha before downscale; lower = stronger wisp lift |
 | `ALPHA_SNAP_HIGH` | 0.992 | Alpha values above this snap to 1.0 |
-| `PORTRAIT_FACE_TOP_RATIO` | 0.30 | Vertical face position in portrait crops (fraction from top) |
+| `FACE_TOP_RATIO` | 0.30 | Vertical face position (fraction from top), applied to every crop |
 
 ---
 
