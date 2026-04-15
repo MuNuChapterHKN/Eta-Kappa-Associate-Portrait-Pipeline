@@ -33,11 +33,11 @@ Built for the Mu Nu chapter of IEEE-HKN at Politecnico di Torino.
 When a new associate cohort comes in, someone has to process dozens of portrait photos: crop them consistently, strip the background, and drop each face onto the chapter background. This tool automates that in six deterministic steps:
 
 1. **Detect** — Mediapipe locates the face in the image. OpenCV Haar cascade kicks in automatically if Mediapipe isn't available for the running Python version.
-2. **Frame** — The image is minimally cropped at its **native aspect ratio** so the face sits 30% from the top and is horizontally centered. No forced 1:1 here — the input's AR becomes the "standard frame" for this subject.
+2. **Scale** — The raw image is Lanczos-downscaled so its longest edge fits `MAX_SIDE` — no cropping. Every subject pixel stays available for the canvas step below.
 3. **Isolate** — rembg strips the background (ISNet or BiRefNet depending on quality setting) with alpha matting enabled. The matting trimap is intentionally wide so the solver has enough room to produce continuous alpha values on frizzy and curly hair instead of a binary cutout. **This step runs exactly once per input**; every output below reuses the same RGBA.
-4. **Archive** — The standard-AR RGBA is re-cropped to 1:1 (face at 30% from top) and saved as `_nobg.png`. Useful for later reuse without reprocessing.
-5. **Compose** — For each uploaded background, the standard-AR RGBA is **re-cropped to the background's own aspect ratio** (face still at 30% from top), then the background is cover-fit underneath and alpha-composited. Output takes on the background's aspect ratio.
-6. **Publish** — Final RGB exports saved as JPEG at q=95, 4:4:4 chroma. The filename carries the AR tag: `photo_bg_studio_16x9.jpg`, `photo_bg_poster_2x3.jpg`.
+4. **Fit** — For each output, a transparent canvas is built at the target aspect ratio: face horizontally centered, face at 30 % from top *when possible*, and — crucially — the subject's **bottom flush with the canvas bottom**. Associates are framed as half-busts with crossed arms, so padding never goes below them; wider ARs get transparent side padding, taller ARs get transparent padding above the head. The subject is never cropped.
+5. **Archive** — The 1:1 canvas (no background) is saved as `_nobg.png`. Same framing algorithm as the composites, so the archival version and the final 1:1 composite are identical above the background layer.
+6. **Compose** — For each uploaded background, the background is cover-fit under the canvas and alpha-composited. Output takes on the background's aspect ratio, saved as JPEG at q=95, 4:4:4 chroma. The filename carries the AR tag: `photo_bg_studio_16x9.jpg`, `photo_bg_poster_2x3.jpg`.
 
 ---
 
@@ -127,7 +127,8 @@ All the quality knobs are constants at the top of `pipeline.py`:
 | `ALPHA_MATTING_ERODE` | 30 | Trimap erosion size (px at output resolution) |
 | `ALPHA_LIFT_GAMMA` | 0.80 | Gamma applied to alpha before downscale; lower = stronger wisp lift |
 | `ALPHA_SNAP_HIGH` | 0.992 | Alpha values above this snap to 1.0 |
-| `FACE_TOP_RATIO` | 0.30 | Vertical face position (fraction from top), applied to every crop |
+| `SUBJECT_ALPHA_THRESHOLD` | 12 | Alpha (0–255) above which a pixel counts as part of the subject when computing the bounding box for canvas sizing |
+| `FACE_TOP_RATIO` | 0.30 | Target face position from top (canvas may pad above when AR forces it, pushing the face lower — bottom stays anchored) |
 
 ---
 

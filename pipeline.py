@@ -4,17 +4,26 @@ Local, GDPR-safe batch processor.
 
 Pipeline (per image):
     1. Face detection (Mediapipe, CPU)
-    2. Frame at the input's native aspect ratio, minimally cropped with face
-       at FACE_TOP_RATIO from top (≤ MAX_SIDE on longest side, LANCZOS)
-    3. Background removal (rembg, alpha matting ON) → "standard-AR" RGBA
-    4. Re-crop the RGBA to 1:1 and save <name>_nobg.png (archival)
-    5. For each background:
-        · re-crop the RGBA to the background's aspect ratio
-        · cover-fit the background under it
-        · save <name>_bg_<bgname>_<WxH>.jpg (RGB, q=95)
+    2. Downscale to MAX_SIDE on the longest edge (Lanczos) — no cropping.
+       Background removal runs on the full frame so every subject pixel
+       is available for later composition.
+    3. Background removal (rembg, alpha matting ON) → RGBA with the
+       subject cut out and a transparent background.
+    4. For each output (archival 1:1 and per-background composite):
+        · build a transparent canvas at the target aspect ratio that
+          contains the whole subject (no crop), with the face horizontally
+          centered, at FACE_TOP_RATIO from top when possible, and the
+          subject's bottom flush with the canvas bottom
+        · paste the subject RGBA at the computed offset
+    5. Archival: save <name>_nobg.png (1:1).
+    6. Composite: cover-fit the background under the canvas and save
+       <name>_bg_<bgname>_<WxH>.jpg (RGB, q=95).
 
-The background removal runs *once* per input at the native aspect ratio;
-each output composite is a cheap re-crop + alpha-compose, not a re-matting.
+The subject silhouette is aspect-ratio-invariant: once the background is
+gone, each output just parks the same silhouette on a canvas sized for its
+target AR. Wider AR than the subject → transparent side padding; taller AR
+→ transparent padding above (never below — half-bust subjects always stand
+on the canvas floor).
 
 NOTE: heavy dependencies (cv2, mediapipe, rembg, PIL) are imported lazily
 inside the functions that need them so the Streamlit app can render
@@ -76,6 +85,13 @@ MAX_WORK_SIDE = 2560
 
 FACE_TOP_RATIO = 0.30  # face vertical position in crop (from top), universal
 PORTRAIT_FACE_TOP_RATIO = FACE_TOP_RATIO  # backward-compat alias
+
+# Alpha threshold (0-255) for deciding which pixels belong to the subject
+# when computing the bounding box for canvas sizing. 12 ≈ 5% opacity: low
+# enough to include faint hair wisps (the "halo") as part of the subject so
+# the canvas doesn't clip them, high enough to ignore pure numerical noise
+# left by the matting solver in nominally-transparent regions.
+SUBJECT_ALPHA_THRESHOLD = 12
 
 # ---------------------------------------------------------------------------
 # Models
@@ -389,50 +405,152 @@ def smart_square_crop(image_bgr, face_x: int, face_y: int):
     return crop
 
 
-def crop_rgba_to_ar(
+def _subject_bbox(subject_rgba, alpha_threshold: int = SUBJECT_ALPHA_THRESHOLD):
+    """
+    Return ``(x0, y0, x1, y1)`` bounding the pixels whose α exceeds
+    ``alpha_threshold``. Falls back to the full image extent if nothing
+    passes the threshold (shouldn't happen in practice — matting always
+    leaves some opaque content for a real portrait).
+    """
+    import numpy as np
+    arr = np.asarray(subject_rgba)
+    if arr.ndim != 3 or arr.shape[2] < 4:
+        h, w = arr.shape[:2]
+        return 0, 0, w, h
+    alpha = arr[..., 3]
+    mask = alpha > alpha_threshold
+    if not mask.any():
+        h, w = alpha.shape
+        return 0, 0, w, h
+    ys, xs = np.where(mask)
+    return int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
+
+
+def canvas_for_ar(
     subject_rgba,
     face_x: int,
     face_y: int,
     target_ar: float,
     face_top_ratio: float = FACE_TOP_RATIO,
+    max_side: int = MAX_SIDE,
 ):
     """
-    Re-crop an already-matted RGBA subject to ``target_ar``, keeping the face
-    at ``(new_W/2, face_top_ratio * new_H)``.
+    Build a transparent canvas at ``target_ar`` containing the whole subject
+    (no pixels cropped), with these placement rules:
 
-    Used for:
-      · the 1:1 archival PNG (``target_ar = 1.0``)
-      · each per-background composite (``target_ar = bg_w / bg_h``)
+      · face horizontally centered: ``face_x_canvas = CW / 2``
+      · face at ``face_top_ratio`` from top when possible (30 % default)
+      · **bottom-anchored**: the subject's bottom edge is the canvas's
+        bottom edge — never pad below. Associates are framed as half-busts
+        with crossed arms, so adding space beneath them would look wrong.
 
-    If an edge is hit (rare, happens when the face is close to the border of
-    the native-AR standard frame), the crop clamps to the image bounds and
-    accepts a small deviation in face position rather than upscaling.
+    Algorithm
+    ---------
+    Let ``above = face_y − subject_top`` and ``below = subject_bottom −
+    face_y`` (both in pixels). With the bottom anchored:
+
+        face_in_canvas_y = CH − below
+
+    Placing the face at ``face_top_ratio · CH`` fixes ``CH`` at
+    ``below / (1 − face_top_ratio)``. If the subject's above-face portion
+    is taller than the resulting above-face slack, grow ``CH`` to fit the
+    whole subject (``above + below``) and accept a face slightly higher
+    than the ideal 30 %. The extra height becomes transparent padding
+    above the head.
+
+    Horizontally, ``CW ≥ 2 · max(left, right)`` so the face stays
+    centered without clipping either side. Then lock the AR:
+
+        if CH · target_ar ≥ CW_min   →   CW = CH · target_ar
+        else                         →   CW = CW_min, grow CH to CW/target_ar
+
+    Growing CH in the AR-lock branch only adds more transparent padding
+    *above* the head — the bottom anchor is preserved.
+
+    Finally the canvas is Lanczos-downscaled to ``max_side`` on its longest
+    edge so the archival / composite outputs stay bounded regardless of how
+    much padding we added.
     """
-    from PIL import Image  # noqa: F401 — just to ensure import is sane
-    w, h = subject_rgba.size
+    from PIL import Image
+    sx0, sy0, sx1, sy1 = _subject_bbox(subject_rgba)
+    sw = max(1, sx1 - sx0)
+    sh = max(1, sy1 - sy0)
+
+    # Clamp face coords to the subject bbox. If detection puts the face
+    # slightly outside the silhouette (e.g. on a hair wisp that fell below
+    # the α threshold), snap it to the nearest subject pixel so the math
+    # stays sane.
+    fx = max(sx0, min(sx1 - 1, int(face_x)))
+    fy = max(sy0, min(sy1 - 1, int(face_y)))
+
+    above = fy - sy0
+    below = sy1 - fy
+    left = fx - sx0
+    right = sx1 - fx
+
     fty = face_top_ratio
+    # CH from the face-at-30 % rule (bottom anchored) and from the
+    # no-crop-subject rule. Take the larger.
+    ch_from_face = below / (1 - fty) if fty < 1 else float("inf")
+    ch = max(ch_from_face, float(above + below))
 
-    ch_max = min(
-        float(h),
-        face_y / fty if fty > 0 else float("inf"),
-        (h - face_y) / (1 - fty) if fty < 1 else float("inf"),
-        (2 * face_x) / target_ar if target_ar > 0 else float("inf"),
-        (2 * (w - face_x)) / target_ar if target_ar > 0 else float("inf"),
-        w / target_ar if target_ar > 0 else float("inf"),
-    )
-    ch = max(1.0, ch_max)
-    cw = ch * target_ar
+    # CW must fit the wider of the two face-to-edge distances (doubled,
+    # because the face is horizontally centered).
+    cw_min = 2.0 * max(left, right)
 
-    cx = face_x - cw / 2
-    cy = face_y - fty * ch
+    # Lock aspect ratio. If the AR-implied CW is smaller than cw_min, grow
+    # CW and re-grow CH so the AR holds — the extra CH becomes transparent
+    # padding above the head (bottom stays anchored).
+    cw = ch * target_ar if target_ar > 0 else cw_min
+    if cw < cw_min:
+        cw = cw_min
+        ch = cw / target_ar if target_ar > 0 else ch
 
-    cx = max(0.0, min(float(w) - cw, cx))
-    cy = max(0.0, min(float(h) - ch, cy))
+    CW = max(1, int(round(cw)))
+    CH = max(1, int(round(ch)))
 
-    x0, y0 = int(round(cx)), int(round(cy))
-    x1 = min(w, x0 + int(round(cw)))
-    y1 = min(h, y0 + int(round(ch)))
-    return subject_rgba.crop((x0, y0, x1, y1))
+    # Paste position. Bottom-anchored vertically; face-centered horizontally.
+    sub_top = CH - sh
+    sub_left = int(round(CW / 2.0 - left))
+
+    # Clamp in case of rounding (rare; sub_top/sub_left are already ≥ 0 by
+    # construction, but rounding can push them by one pixel).
+    sub_top = max(0, min(CH - sh, sub_top))
+    sub_left = max(0, min(CW - sw, sub_left))
+
+    subject_crop = subject_rgba.crop((sx0, sy0, sx1, sy1))
+    canvas = Image.new("RGBA", (CW, CH), (0, 0, 0, 0))
+    canvas.paste(subject_crop, (sub_left, sub_top), subject_crop)
+
+    # Cap final size — padding can push the canvas well above the matting
+    # resolution when the target AR differs a lot from the subject's own AR.
+    longest = max(CW, CH)
+    if longest > max_side:
+        scale = max_side / longest
+        new_w = max(1, int(round(CW * scale)))
+        new_h = max(1, int(round(CH * scale)))
+        canvas = canvas.resize((new_w, new_h), Image.LANCZOS)
+
+    return canvas
+
+
+def _downscale_for_matting(image_bgr, face_x: int, face_y: int, max_side: int = MAX_SIDE):
+    """
+    Lanczos-downscale the raw image so its longest edge is ≤ ``max_side``.
+    No cropping — every subject pixel stays available for the canvas step
+    that runs after background removal. Returns ``(image, (face_x, face_y))``
+    with face coords mapped into the downscaled space.
+    """
+    import cv2
+    h, w = image_bgr.shape[:2]
+    longest = max(w, h)
+    if longest <= max_side:
+        return image_bgr, (int(face_x), int(face_y))
+    scale = max_side / longest
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    out = cv2.resize(image_bgr, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+    return out, (int(round(face_x * scale)), int(round(face_y * scale)))
 
 
 def ar_label(width: int, height: int, max_denom: int = 20) -> str:
@@ -731,15 +849,13 @@ def process_batch(
             fx, fy, detected = detect_face_center(raw)
             stage_times["face"] = time.perf_counter() - t0
 
-            # Frame at the input's NATIVE aspect ratio (minimally cropped to
-            # place the face at FACE_TOP_RATIO from top). This is the "standard
-            # frame" on which background removal runs — one matting pass, then
-            # every output re-crops the resulting RGBA to its own target AR.
+            # Downscale (not crop) the raw to bound matting cost. Every
+            # subject pixel stays available, so when an output canvas has a
+            # very different aspect ratio from the input, padding — not
+            # cropping — absorbs the mismatch. Face coords follow the scale.
             t0 = time.perf_counter()
-            raw_h, raw_w = raw.shape[:2]
-            native_ar = raw_w / raw_h if raw_h else 1.0
-            framed, (face_in_crop_x, face_in_crop_y) = smart_crop_to_ar(
-                raw, fx, fy, native_ar
+            framed, (face_in_frame_x, face_in_frame_y) = _downscale_for_matting(
+                raw, fx, fy
             )
             stage_times["crop"] = time.perf_counter() - t0
 
@@ -749,14 +865,15 @@ def process_batch(
             )
             stage_times["matting"] = time.perf_counter() - t0
 
-            # Archival 1:1 PNG — a re-crop of the standard-AR RGBA centered on
-            # the face. Same role as before; no re-matting.
+            # Archival 1:1 PNG — same canvas algorithm as the composites so
+            # the 1:1 nobg and any 1:1 background output share identical
+            # framing of the subject (only the background layer differs).
             t0 = time.perf_counter()
-            nobg_crop = crop_rgba_to_ar(
-                subject, face_in_crop_x, face_in_crop_y, 1.0
+            nobg_canvas = canvas_for_ar(
+                subject, face_in_frame_x, face_in_frame_y, 1.0
             )
             nobg_name = f"{img_path.stem}_nobg.png"
-            nobg_crop.save(output_dir / nobg_name, format="PNG", optimize=True)
+            nobg_canvas.save(output_dir / nobg_name, format="PNG", optimize=True)
             produced.append(nobg_name)
             stage_times["save_png"] = time.perf_counter() - t0
 
@@ -765,8 +882,8 @@ def process_batch(
             # can tell variants apart at a glance.
             t0 = time.perf_counter()
             for bg_name, bg_pil, bg_ar, bg_ar_tag in bg_items:
-                subject_for_bg = crop_rgba_to_ar(
-                    subject, face_in_crop_x, face_in_crop_y, bg_ar
+                subject_for_bg = canvas_for_ar(
+                    subject, face_in_frame_x, face_in_frame_y, bg_ar
                 )
                 composed = composite_on_background(subject_for_bg, bg_pil)
                 out_name = f"{img_path.stem}_bg_{bg_name}_{bg_ar_tag}.jpg"
