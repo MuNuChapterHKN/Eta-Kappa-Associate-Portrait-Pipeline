@@ -81,7 +81,9 @@ The design choice here is "purity first": the raw image goes into matting at ful
 
 **Full raw resolution.** The raw image is passed to rembg as-is — no pre-downscale, no supersample. At 24 MP inputs this means pymatting solves the alpha matte on tens of millions of pixels, which is slow; on a 2026-era Apple Silicon machine expect a few seconds of matting per image. In return: the trimap "uncertain" band is wide enough in native pixel space that the solver has real texture to work with on curly hair, instead of a bilinear-stretched version of a 1024²-internal mask.
 
-**Near-one α snap.** The only post-matting touch. Values above 0.992 snap to exactly 1.0 so the opaque body of the subject stays perfectly opaque when composited — nothing else is altered.
+**α-blended foreground colour.** pymatting's colour estimator smooths the *decontaminated* RGB (the estimate of what the pixel would look like without the old background behind it). On dense opaque hair that smoothing shows up as flat "paint bucket" patches — wide regions of near-identical tone where the source photo had real texture. Fix: at α ≳ 0.99 the original pixel already is the pure foreground colour (background bleed ≤ 2 %), so use the original photo directly. Below α ≈ 0.92 keep the decontaminated version (real bleed needs removing there). Smoothstep blend in between, no sharpening or unsharp mask — the texture at α≈1 is exactly what was in the source.
+
+**Near-one α snap.** Values above 0.992 snap to exactly 1.0 so the opaque body of the subject stays perfectly opaque when composited.
 
 ---
 
@@ -121,6 +123,8 @@ All the quality knobs are constants at the top of `pipeline.py`:
 | `ALPHA_MATTING_BG` | 15 | Background threshold; lower = wider uncertain band |
 | `ALPHA_MATTING_ERODE` | 30 | Trimap erosion size (px at raw resolution) |
 | `ALPHA_SNAP_HIGH` | 0.992 | Alpha values above this snap to 1.0 |
+| `DECONTAM_BLEND_LO` | 0.92 | Below this α, use pymatting's decontaminated colour as-is |
+| `DECONTAM_BLEND_HI` | 0.99 | Above this α, use the original photo colour directly (eliminates the "paint bucket" smoothing on dense hair) |
 | `SUBJECT_ALPHA_THRESHOLD` | 12 | Alpha (0–255) above which a pixel counts as part of the subject when computing the bounding box for canvas sizing |
 | `FACE_TOP_RATIO` | 0.30 | Target face position from top (canvas may pad above when AR forces it, pushing the face lower — bottom stays anchored) |
 

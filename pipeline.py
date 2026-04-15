@@ -65,6 +65,20 @@ ALPHA_MATTING_ERODE = 30
 # raw output to show through.
 ALPHA_SNAP_HIGH = 0.992
 
+# α-blend window between pymatting's decontaminated RGB and the original
+# image RGB. pymatting's foreground estimator smooths locally, so dense
+# opaque hair regions come out as flat patches of average tone — "paint
+# bucket" artefact. At α ≥ HI the original image is already an excellent
+# estimate of the pure foreground colour (background bleed ≤ 2 %), so we
+# use it directly. Below LO the decontamination is still needed (semi-
+# transparent hair with real bg bleed). Smoothstep in between.
+#
+# This only *replaces* decontam with original — no unsharp mask, no detail
+# injection, no sharpening. The texture at α≈1 pixels is exactly the
+# texture that was in the source photo.
+DECONTAM_BLEND_LO = 0.92
+DECONTAM_BLEND_HI = 0.99
+
 FACE_TOP_RATIO = 0.30  # face vertical position in crop (from top), universal
 PORTRAIT_FACE_TOP_RATIO = FACE_TOP_RATIO  # backward-compat alias
 
@@ -563,15 +577,19 @@ def remove_background(
     model_name: str = DEFAULT_MODEL,
 ):
     """
-    Run rembg + alpha matting on the **full-resolution** input with no
-    pre-processing beyond BGR→RGB and no post-processing beyond the α-snap
-    in ``_refine_alpha``. No supersampling, no downscaling, no detail
-    injection, no unsharp mask, no gamma lift.
+    Run rembg + alpha matting on the **full-resolution** input. No
+    supersampling, no downscaling, no unsharp mask, no gamma lift.
 
-    The rembg output (pymatting-decontaminated RGB + α-matted alpha) flows
-    through to the canvas step untouched.
+    One targeted fix over pure pymatting output: α-weighted blend between
+    pymatting's decontaminated RGB and the original image RGB. At α ≳ 0.99
+    we use the original directly (its bg bleed is negligible), which
+    eliminates the "paint bucket" flat-colour artefact that the decontam
+    estimator produces in dense opaque hair. Below α ≈ 0.92 we keep the
+    decontaminated colour (real bg bleed needs removing). Smoothstep in
+    between keeps the transition invisible.
     """
     import cv2
+    import numpy as np
     from PIL import Image
     from rembg import remove
 
@@ -586,7 +604,20 @@ def remove_background(
         alpha_matting_background_threshold=ALPHA_MATTING_BG,
         alpha_matting_erode_size=ALPHA_MATTING_ERODE,
     ).convert("RGBA")
-    return _refine_alpha(out)
+
+    # α-smoothstep blend: decontam → original as α rises.
+    out_arr = np.array(out, dtype=np.uint8)
+    alpha_f = out_arr[..., 3:4].astype(np.float32) / 255.0
+    orig_rgb_f = rgb.astype(np.float32)
+    decontam_rgb_f = out_arr[..., :3].astype(np.float32)
+
+    lo, hi = DECONTAM_BLEND_LO, DECONTAM_BLEND_HI
+    t = np.clip((alpha_f - lo) / (hi - lo), 0.0, 1.0)
+    blend_w = t * t * (3.0 - 2.0 * t)  # smoothstep → 0..1
+    blended = decontam_rgb_f * (1.0 - blend_w) + orig_rgb_f * blend_w
+    out_arr[..., :3] = np.clip(blended, 0, 255).astype(np.uint8)
+
+    return _refine_alpha(Image.fromarray(out_arr, "RGBA"))
 
 
 # ---------------------------------------------------------------------------
