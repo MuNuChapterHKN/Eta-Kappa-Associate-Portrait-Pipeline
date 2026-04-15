@@ -79,6 +79,18 @@ ALPHA_SNAP_HIGH = 0.992
 DECONTAM_BLEND_LO = 0.92
 DECONTAM_BLEND_HI = 0.99
 
+# Bilateral filter applied to the original RGB *before* the α-blend, to
+# damp JPEG compression blocks without touching strand edges.
+#   cv2.bilateralFilter smooths pixels whose colours are close within a
+#   spatial neighbourhood, so 8×8 DCT blocks (near-uniform colour inside)
+#   get averaged together while real strand boundaries (large colour
+#   differences) stay crisp. sigmaColor is kept tight so clump-level
+#   variation survives — only JPEG quantisation noise (< ~15 units) gets
+#   smoothed.
+ORIG_RGB_BILATERAL_D = 7
+ORIG_RGB_BILATERAL_SIGMA_COLOR = 18
+ORIG_RGB_BILATERAL_SIGMA_SPACE = 5
+
 FACE_TOP_RATIO = 0.30  # face vertical position in crop (from top), universal
 PORTRAIT_FACE_TOP_RATIO = FACE_TOP_RATIO  # backward-compat alias
 
@@ -605,10 +617,22 @@ def remove_background(
         alpha_matting_erode_size=ALPHA_MATTING_ERODE,
     ).convert("RGBA")
 
-    # α-smoothstep blend: decontam → original as α rises.
+    # Bilateral-smooth the original RGB to damp JPEG quantisation blocks
+    # without touching strand edges. This is run on the *original* image
+    # (not on the decontam output) because we're about to blend toward it
+    # at high α — we want its JPEG artefacts gone before they reach the
+    # composite.
+    orig_smoothed = cv2.bilateralFilter(
+        rgb,
+        d=ORIG_RGB_BILATERAL_D,
+        sigmaColor=ORIG_RGB_BILATERAL_SIGMA_COLOR,
+        sigmaSpace=ORIG_RGB_BILATERAL_SIGMA_SPACE,
+    )
+
+    # α-smoothstep blend: decontam → (bilateral-smoothed) original as α rises.
     out_arr = np.array(out, dtype=np.uint8)
     alpha_f = out_arr[..., 3:4].astype(np.float32) / 255.0
-    orig_rgb_f = rgb.astype(np.float32)
+    orig_rgb_f = orig_smoothed.astype(np.float32)
     decontam_rgb_f = out_arr[..., :3].astype(np.float32)
 
     lo, hi = DECONTAM_BLEND_LO, DECONTAM_BLEND_HI
