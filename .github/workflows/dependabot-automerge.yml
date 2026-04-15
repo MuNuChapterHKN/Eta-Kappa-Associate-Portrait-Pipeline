@@ -1,0 +1,56 @@
+name: Dependabot auto-merge
+
+# Approves and enables auto-merge on Dependabot PRs.
+# `--auto` waits for the required status checks (Lint, Smoke, Secret scan) to
+# pass before actually merging — branch protection on `main` enforces this.
+#
+# Policy:
+#   - patch + minor (any ecosystem) → auto-merge
+#   - major github-actions bumps    → auto-merge (action majors are usually safe)
+#   - major pip bumps               → leave for manual review (comment posted)
+
+on: pull_request_target
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  automerge:
+    runs-on: ubuntu-latest
+    if: github.actor == 'dependabot[bot]'
+    steps:
+      - name: Fetch Dependabot metadata
+        id: meta
+        uses: dependabot/fetch-metadata@v2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Approve PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: gh pr review --approve "$PR_URL"
+
+      - name: Enable auto-merge (safe updates)
+        if: |
+          steps.meta.outputs.update-type == 'version-update:semver-patch' ||
+          steps.meta.outputs.update-type == 'version-update:semver-minor' ||
+          (steps.meta.outputs.update-type == 'version-update:semver-major' &&
+           steps.meta.outputs.package-ecosystem == 'github_actions')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: gh pr merge --auto --squash "$PR_URL"
+
+      - name: Comment on major pip bumps
+        if: |
+          steps.meta.outputs.update-type == 'version-update:semver-major' &&
+          steps.meta.outputs.package-ecosystem == 'pip'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PKG: ${{ steps.meta.outputs.dependency-names }}
+        run: |
+          gh pr comment "$PR_URL" --body \
+            "Major bump for **$PKG** — held for manual review. Merge when you've confirmed nothing breaks at runtime."

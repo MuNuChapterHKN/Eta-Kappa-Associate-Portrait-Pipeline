@@ -2,9 +2,9 @@ name: CodeQL
 
 on:
   push:
-    branches: [master]
+    branches: [main]
   pull_request:
-    branches: [master]
+    branches: [main]
   schedule:
     # Weekly run catches CVEs in dependencies even when the codebase is quiet.
     - cron: "23 6 * * 1"

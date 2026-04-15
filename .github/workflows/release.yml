@@ -2,7 +2,7 @@ name: Release on version bump
 
 on:
   push:
-    branches: [master]
+    branches: [main]
     paths: [VERSION]
   workflow_dispatch:
 
