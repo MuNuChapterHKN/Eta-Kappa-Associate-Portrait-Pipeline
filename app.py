@@ -10,10 +10,10 @@ import datetime as dt
 import html
 import io
 import platform
-import shlex
 import subprocess
 import sys
 import textwrap
+import time
 from pathlib import Path
 from typing import List, Optional
 
@@ -71,6 +71,16 @@ def inject_css() -> None:
 
 def now_ts() -> str:
     return dt.datetime.now().strftime("%H:%M:%S")
+
+
+def fmt_secs(s: float) -> str:
+    """Human-readable duration: 0.8s, 12.4s, 1m23s, 4m07s."""
+    if s < 0.1:
+        return f"{s * 1000:.0f}ms"
+    if s < 60:
+        return f"{s:.1f}s"
+    m, r = divmod(s, 60)
+    return f"{int(m)}m{int(r):02d}s"
 
 
 def _pick_directory_macos(initial: str = "") -> Optional[str]:
@@ -323,14 +333,18 @@ def ensure_models_ready(model_name: str) -> None:
             status.write(f"**›** {msg}")
 
         try:
+            t0 = time.perf_counter()
             prewarm(model_name=model_name, on_step=_step)
+            dt_warm = time.perf_counter() - t0
+            _step(f"Warm-up completed in {fmt_secs(dt_warm)}")
             status.update(
-                label=f"Models ready · {model_name}",
+                label=f"Models ready · {model_name} · {fmt_secs(dt_warm)}",
                 state="complete",
                 expanded=False,
             )
             st.session_state["models_ready"] = True
             st.session_state["models_ready_for"] = model_name
+            st.session_state["_warmup_secs"] = dt_warm
         except Exception as e:  # noqa: BLE001
             status.update(
                 label=f"Warm-up failed: {e}",
@@ -738,6 +752,8 @@ def main():
 
         ok_count = 0
         err_count = 0
+        total_elapsed = 0.0
+        batch_t0 = time.perf_counter()
         progress_bar = progress_slot.progress(0.0)
 
         def on_start(idx: int, total: int, filename: str):
@@ -760,11 +776,33 @@ def main():
             render_log(log_slot)
 
         def on_progress(r: ItemResult):
-            nonlocal ok_count, err_count
+            nonlocal ok_count, err_count, total_elapsed
             if r.index == 0:
                 push_log("err", html.escape(r.detail))
                 render_log(log_slot)
                 return
+
+            total_elapsed += r.elapsed_s
+            avg = total_elapsed / max(r.index, 1)
+            remaining = (r.total - r.index) * avg
+
+            # Compact stage breakdown: matting is the heavy one, worth
+            # calling out. Others are in the tooltip-ish dim line.
+            stages = r.stage_times or {}
+            matting_s = stages.get("matting", 0.0)
+            compose_s = stages.get("composite", 0.0)
+            other_s = max(
+                0.0,
+                r.elapsed_s - matting_s - compose_s
+                - stages.get("save_png", 0.0),
+            )
+            time_tag = (
+                f'<span class="dim"> · '
+                f'<b>{fmt_secs(r.elapsed_s)}</b> total · '
+                f'matting {fmt_secs(matting_s)} · '
+                f'composite {fmt_secs(compose_s)} · '
+                f'other {fmt_secs(other_s)}</span>'
+            )
 
             if r.ok:
                 ok_count += 1
@@ -775,23 +813,28 @@ def main():
                 push_log(
                     "ok",
                     f'<span class="path">{html.escape(r.filename)}</span> '
-                    f'· {html.escape(r.detail)}{produced}',
+                    f'· {html.escape(r.detail)}{produced}{time_tag}',
                 )
             else:
                 err_count += 1
                 push_log(
                     "err",
                     f'<span class="path">{html.escape(r.filename)}</span> '
-                    f'· {html.escape(r.detail)}',
+                    f'· {html.escape(r.detail)}'
+                    f'<span class="dim"> · {fmt_secs(r.elapsed_s)}</span>',
                 )
 
             frac = r.index / max(r.total, 1)
             progress_bar.progress(min(frac, 1.0))
+            eta_str = (
+                f' · ETA {fmt_secs(remaining)}' if r.index < r.total else ''
+            )
             status_slot.markdown(
                 f"""
                 <div class="hkn-status">
                     <span class="label">Processing</span>
-                    <span class="value">{r.index} of {r.total} · {html.escape(r.filename)}</span>
+                    <span class="value">{r.index} of {r.total} · {html.escape(r.filename)}
+                        <span class="dim"> · avg {fmt_secs(avg)}/img{eta_str}</span></span>
                     <span class="count">{int(frac * 100):02d}%</span>
                 </div>
                 """,
@@ -812,17 +855,29 @@ def main():
                 model_name=model_name,
                 supersample=supersample_factor,
             )
+            wall = time.perf_counter() - batch_t0
+            processed = ok_count + err_count
+            avg_all = (total_elapsed / processed) if processed else 0.0
             push_log(
                 "info",
                 f'Run complete · <span class="path">{ok_count} ok</span> · '
-                f'{err_count} error(s).',
+                f'{err_count} error(s) · '
+                f'wall <b>{fmt_secs(wall)}</b> · '
+                f'avg <b>{fmt_secs(avg_all)}</b>/img'
+                + (
+                    f' · warm-up '
+                    f'{fmt_secs(st.session_state.get("_warmup_secs", 0.0))}'
+                    if st.session_state.get("_warmup_secs")
+                    else ""
+                ),
             )
             progress_bar.progress(1.0)
             status_slot.markdown(
                 f"""
                 <div class="hkn-status">
                     <span class="label">Status</span>
-                    <span class="value">Complete · {ok_count} processed, {err_count} failed</span>
+                    <span class="value">Complete · {ok_count} processed, {err_count} failed
+                        <span class="dim"> · {fmt_secs(wall)} total · {fmt_secs(avg_all)}/img</span></span>
                     <span class="count">100%</span>
                 </div>
                 """,

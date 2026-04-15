@@ -19,7 +19,9 @@ user actually clicks "Begin processing".
 from __future__ import annotations
 
 import io
-from dataclasses import dataclass
+import platform
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
@@ -40,19 +42,18 @@ ALPHA_MATTING_FG = 250
 ALPHA_MATTING_BG = 15
 ALPHA_MATTING_ERODE = 30
 
-# Multi-stage alpha refinement (after matting).
-# These values are deliberately *gentle* — alpha matting's whole purpose is
-# to produce continuous translucent values on fine hair wisps, and a heavy
-# post-filter flattens them into a "cut-out" look. The bilateral is narrow
-# (only removes model-upsampling stair-steps), the Gaussian is sub-pixel
-# (just dithers), and snap thresholds are at the noise floor (only kill
-# truly near-zero / near-one pixels, not translucent wisps).
-ALPHA_BILATERAL_D = 5
-ALPHA_BILATERAL_SIGMA_COLOR = 10
-ALPHA_BILATERAL_SIGMA_SPACE = 3
+# Alpha refinement — kept *very* gentle so faint wisps (α ≈ 0.05–0.15) that
+# form the "halo" around the main hair strands survive to the final output.
+# No bilateral filter at all (eats isolated thin strands) and no low snap
+# (would zero the halo). Only a sub-pixel Gaussian and a near-one snap.
 ALPHA_POLISH_SIGMA = 0.3
-ALPHA_SNAP_LOW = 0.008
 ALPHA_SNAP_HIGH = 0.992
+
+# Gamma < 1 on α *lifts* low-alpha values: α ^ 0.80 takes 0.10 → 0.16
+# (+60 %) and 0.05 → 0.087 (+74 %) while leaving 1.0 unchanged. This brings
+# back the faint translucent halo of fine hair that the model+Lanczos
+# downscale pipeline tends to attenuate.
+ALPHA_LIFT_GAMMA = 0.80
 
 # Supersampling factors — the matting model runs at 1024² internally.
 # Processing the input at >1× and Lanczos-downsampling the resulting RGBA
@@ -84,14 +85,87 @@ HIGH_QUALITY_MODEL = "birefnet-portrait"
 _rembg_sessions: dict = {}
 _face_detector = None
 _face_backend: Optional[str] = None  # "mediapipe" | "opencv"
+_active_providers: Optional[List[str]] = None  # set by get_rembg_session
+
+
+# Models that hang or take unreasonably long to compile under the CoreML
+# provider. These are transformer-based graphs whose ops stress CoreML's
+# graph converter — safer to run them on CPU than risk a multi-minute hang
+# on first session creation. Convolutional models (u2net, isnet) are fine.
+COREML_BLACKLIST = {
+    "birefnet-portrait",
+    "birefnet-general",
+    "birefnet-general-lite",
+    "birefnet-massive",
+    "sam",
+}
+
+
+def _preferred_providers(model_name: str = DEFAULT_MODEL) -> List[str]:
+    """
+    Return the onnxruntime execution-provider list to use for rembg.
+
+    On macOS (Apple Silicon or Intel with a GPU) we prefer CoreML, which
+    dispatches to the Apple Neural Engine + Metal GPU and typically gives
+    3–10× speedup vs pure CPU for u2net / isnet.
+
+    CoreML gracefully falls back op-by-op to CPU when it encounters
+    unsupported ops, so listing it first is *usually* safe. The exception
+    is transformer-heavy graphs (the birefnet family, SAM): CoreML's graph
+    compiler can spend minutes — or hang — converting them, so those
+    models are force-routed to pure CPU via COREML_BLACKLIST.
+    """
+    try:
+        import onnxruntime as ort
+    except Exception:
+        return ["CPUExecutionProvider"]
+
+    available = set(ort.get_available_providers())
+    preferred: List[str] = []
+
+    if (
+        platform.system() == "Darwin"
+        and "CoreMLExecutionProvider" in available
+        and model_name not in COREML_BLACKLIST
+    ):
+        preferred.append("CoreMLExecutionProvider")
+
+    # CUDA / DirectML left off by design: this app is targeted at macOS
+    # portable installs with no system-wide GPU runtime requirement.
+
+    preferred.append("CPUExecutionProvider")
+    return preferred
 
 
 def get_rembg_session(model_name: str = DEFAULT_MODEL):
     """Lazily create and cache a rembg session for ``model_name``."""
+    global _active_providers
     if model_name not in _rembg_sessions:
         from rembg import new_session  # slow import
-        _rembg_sessions[model_name] = new_session(model_name)
+
+        providers = _preferred_providers(model_name)
+        # Try with the preferred list first (CoreML + CPU on macOS). If
+        # session creation fails — e.g. a rare model op is rejected by
+        # CoreML at graph-build time instead of falling through — drop to
+        # CPU-only so the user still gets a working pipeline.
+        try:
+            _rembg_sessions[model_name] = new_session(
+                model_name, providers=providers
+            )
+            _active_providers = providers
+        except Exception:
+            cpu_only = ["CPUExecutionProvider"]
+            _rembg_sessions[model_name] = new_session(
+                model_name, providers=cpu_only
+            )
+            _active_providers = cpu_only
     return _rembg_sessions[model_name]
+
+
+def get_active_providers() -> List[str]:
+    """Return the provider list that was actually used for the last
+    session creation (empty list before the first session)."""
+    return list(_active_providers) if _active_providers else []
 
 
 def get_face_detector() -> Tuple[object, str]:
@@ -170,6 +244,14 @@ def prewarm(
     # Surface the actual rembg session class so the user can visually confirm
     # which backend is running (e.g. BiRefNetSessionPortrait vs IsnetGeneralUseSession).
     _step(f"→ rembg session class: {type(session).__name__}")
+
+    # Surface the onnxruntime execution providers — "CoreMLExecutionProvider"
+    # means the model is dispatching to the Apple Neural Engine + Metal GPU.
+    # "CPUExecutionProvider" alone means we're on CPU fallback.
+    providers = get_active_providers()
+    if providers:
+        tag = "Metal / ANE" if "CoreMLExecutionProvider" in providers else "CPU only"
+        _step(f"→ onnxruntime providers: {' + '.join(providers)}  ({tag})")
 
     _step("Ready")
 
@@ -251,15 +333,16 @@ def smart_square_crop(image_bgr, face_x: int, face_y: int):
 # ---------------------------------------------------------------------------
 def _refine_alpha(rgba):
     """
-    Multi-stage alpha refinement — run *after* alpha matting.
+    Minimal alpha refinement — run *after* alpha matting.
 
-        1. Bilateral filter on α: smooths stair-stepping (from the model's
-           low-res mask upsampled to 2048²) while preserving the silhouette
-           because bilateral weights by pixel-value similarity.
-        2. Tiny Gaussian polish: sub-pixel anti-aliasing.
-        3. Hard-snap near 0 / near 1: kills faint ghost halos and faint
-           color fringes without erasing translucent hair wisps in the
-           middle range.
+        1. Sub-pixel Gaussian polish: light dithering of pixel-boundary
+           stair-steps.
+        2. Snap near-one to exact 1 (keeps the opaque body perfectly
+           opaque without affecting any translucent pixel).
+
+    Intentionally does **not** bilateral-filter or low-snap α: both erase
+    the faint wisps (α in ~5-15 %) that surround the main hair strands and
+    are what separate "cutout" from "photoreal".
     """
     import numpy as np
     import cv2
@@ -268,15 +351,7 @@ def _refine_alpha(rgba):
     arr = np.array(rgba)  # H×W×4 uint8
     alpha = arr[..., 3]
 
-    # 1. edge-preserving bilateral
-    alpha = cv2.bilateralFilter(
-        alpha,
-        d=ALPHA_BILATERAL_D,
-        sigmaColor=ALPHA_BILATERAL_SIGMA_COLOR,
-        sigmaSpace=ALPHA_BILATERAL_SIGMA_SPACE,
-    )
-
-    # 2. sub-pixel Gaussian polish
+    # 1. sub-pixel Gaussian polish
     k = max(3, int(ALPHA_POLISH_SIGMA * 6) | 1)
     alpha = cv2.GaussianBlur(
         alpha.astype(np.float32),
@@ -285,9 +360,8 @@ def _refine_alpha(rgba):
         sigmaY=ALPHA_POLISH_SIGMA,
     )
 
-    # 3. snap near-extremes to exact 0 / 1
+    # 2. snap only near-one (keep faint wisps alive)
     a = alpha / 255.0
-    a = np.where(a < ALPHA_SNAP_LOW, 0.0, a)
     a = np.where(a > ALPHA_SNAP_HIGH, 1.0, a)
     arr[..., 3] = np.clip(a * 255.0 + 0.5, 0, 255).astype(np.uint8)
 
@@ -390,13 +464,22 @@ def remove_background(
     detail_strength = 0.9
     enriched = decontam_rgb_f + detail * alpha_f * detail_strength
 
+    # --- 3b. α gamma-lift: rescue faint wisps -----------------------------
+    # The model runs at 1024² internally; wisps thinner than ~2 model pixels
+    # come out with very low α (~8-12 %). Lanczos downscale then averages
+    # them toward 0. Applying α ← α^0.80 *before* the downscale boosts those
+    # faint values so they survive averaging, restoring the halo of fine
+    # hair visible in the source photo.
+    alpha_ch = out_arr[..., 3].astype(np.float32) / 255.0
+    alpha_ch = np.power(alpha_ch, ALPHA_LIFT_GAMMA)
+    out_arr[..., 3] = np.clip(alpha_ch * 255.0 + 0.5, 0, 255).astype(np.uint8)
     out_arr[..., :3] = np.clip(enriched, 0, 255).astype(np.uint8)
     out = Image.fromarray(out_arr, "RGBA")
 
     # --- 4. Lanczos downscale back to target size -------------------------
     # This is where the stair-step anti-aliasing actually happens: 4 pixels
     # of the supersampled RGBA collapse into 1 pixel of output, averaging
-    # the jaggies.
+    # the jaggies. With the α gamma-lift above, faint wisps survive this.
     if out.size != (orig_w, orig_h):
         out = out.resize((orig_w, orig_h), Image.LANCZOS)
 
@@ -451,6 +534,10 @@ class ItemResult:
     ok: bool
     detail: str
     produced: List[str]
+    elapsed_s: float = 0.0
+    # Fine-grained timing of the pipeline stages for this image. Keys:
+    # "decode", "face", "crop", "matting", "save_png", "composite".
+    stage_times: dict = field(default_factory=dict)
 
 
 ProgressFn = Callable[[ItemResult], None]
@@ -495,28 +582,43 @@ def process_batch(
 
     for idx, img_path in enumerate(images, start=1):
         produced: List[str] = []
+        stage_times: dict = {}
         if on_start is not None:
             try:
                 on_start(idx, total, img_path.name)
             except Exception:  # noqa: BLE001
                 pass
+        t_start = time.perf_counter()
         try:
+            t0 = time.perf_counter()
             raw = cv2.imdecode(
                 np.fromfile(str(img_path), dtype=np.uint8), cv2.IMREAD_COLOR
             )
             if raw is None:
                 raise ValueError("cannot decode image (unsupported or corrupted)")
+            stage_times["decode"] = time.perf_counter() - t0
 
+            t0 = time.perf_counter()
             fx, fy, detected = detect_face_center(raw)
+            stage_times["face"] = time.perf_counter() - t0
+
+            t0 = time.perf_counter()
             squared = smart_square_crop(raw, fx, fy)
+            stage_times["crop"] = time.perf_counter() - t0
+
+            t0 = time.perf_counter()
             subject = remove_background(
                 squared, model_name=model_name, supersample=supersample
             )
+            stage_times["matting"] = time.perf_counter() - t0
 
+            t0 = time.perf_counter()
             nobg_name = f"{img_path.stem}_nobg.png"
             subject.save(output_dir / nobg_name, format="PNG", optimize=True)
             produced.append(nobg_name)
+            stage_times["save_png"] = time.perf_counter() - t0
 
+            t0 = time.perf_counter()
             for bg_name, bg_pil in bg_pils:
                 composed = composite_on_background(subject, bg_pil)
                 out_name = f"{img_path.stem}_bg_{bg_name}.jpg"
@@ -528,15 +630,24 @@ def process_batch(
                     optimize=True,
                 )
                 produced.append(out_name)
+            stage_times["composite"] = time.perf_counter() - t0
 
             detail = (
                 "face detected"
                 if detected
                 else "no face found → centered fallback"
             )
-            res = ItemResult(idx, total, img_path.name, True, detail, produced)
+            elapsed = time.perf_counter() - t_start
+            res = ItemResult(
+                idx, total, img_path.name, True, detail, produced,
+                elapsed_s=elapsed, stage_times=stage_times,
+            )
         except Exception as e:  # noqa: BLE001
-            res = ItemResult(idx, total, img_path.name, False, str(e), produced)
+            elapsed = time.perf_counter() - t_start
+            res = ItemResult(
+                idx, total, img_path.name, False, str(e), produced,
+                elapsed_s=elapsed, stage_times=stage_times,
+            )
 
         results.append(res)
         if on_progress is not None:
