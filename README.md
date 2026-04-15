@@ -1,5 +1,19 @@
 # HKN PoliTO — Associate Portrait Pipeline
 
+<p align="center">
+  <a href="https://github.com/MuNuChapterHKN/Eta-Kappa-Associate-Portrait-Pipeline/actions/workflows/ruff.yml"><img src="https://img.shields.io/github/actions/workflow/status/MuNuChapterHKN/Eta-Kappa-Associate-Portrait-Pipeline/ruff.yml?branch=main&style=flat-square&label=lint&labelColor=06080B" alt="Lint"/></a>
+  <a href="https://github.com/MuNuChapterHKN/Eta-Kappa-Associate-Portrait-Pipeline/actions/workflows/smoke.yml"><img src="https://img.shields.io/github/actions/workflow/status/MuNuChapterHKN/Eta-Kappa-Associate-Portrait-Pipeline/smoke.yml?branch=main&style=flat-square&label=tests&labelColor=06080B" alt="Tests"/></a>
+  <a href="https://github.com/MuNuChapterHKN/Eta-Kappa-Associate-Portrait-Pipeline/actions/workflows/codeql.yml"><img src="https://img.shields.io/github/actions/workflow/status/MuNuChapterHKN/Eta-Kappa-Associate-Portrait-Pipeline/codeql.yml?branch=main&style=flat-square&label=codeql&labelColor=06080B" alt="CodeQL"/></a>
+  <a href="https://github.com/MuNuChapterHKN/Eta-Kappa-Associate-Portrait-Pipeline/actions/workflows/gitleaks.yml"><img src="https://img.shields.io/github/actions/workflow/status/MuNuChapterHKN/Eta-Kappa-Associate-Portrait-Pipeline/gitleaks.yml?branch=main&style=flat-square&label=secrets&labelColor=06080B" alt="Secret scan"/></a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/MuNuChapterHKN/Eta-Kappa-Associate-Portrait-Pipeline/releases/latest"><img src="https://img.shields.io/github/v/release/MuNuChapterHKN/Eta-Kappa-Associate-Portrait-Pipeline?style=flat-square&label=release&labelColor=06080B&color=D4A24C" alt="Release"/></a>
+  <img src="https://img.shields.io/badge/python-3.10%E2%80%933.13-D4A24C?style=flat-square&labelColor=06080B" alt="Python 3.10–3.13"/>
+  <img src="https://img.shields.io/badge/platform-macOS%20%C2%B7%20Windows%20%C2%B7%20Linux-D4A24C?style=flat-square&labelColor=06080B" alt="Platform"/>
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-D4A24C?style=flat-square&labelColor=06080B" alt="Apache 2.0"/></a>
+</p>
+
 <div align="center">
   <img src="readme_images/full_interface.png" alt="HKN PoliTO Associate Portrait Pipeline interface" width="840" />
   <br/>
