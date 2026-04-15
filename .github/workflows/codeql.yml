@@ -25,7 +25,10 @@ jobs:
         uses: github/codeql-action/init@v4
         with:
           languages: python
-          queries: security-and-quality
+          # security-extended: real security findings only.
+          # `quality` queries are skipped on purpose — ruff already catches
+          # style issues like unused imports, so CodeQL stays focused on CVEs.
+          queries: security-extended
 
       - name: Perform analysis
         uses: github/codeql-action/analyze@v4
