@@ -1,5 +1,13 @@
 # HKN PoliTO — Associate Portrait Pipeline
 
+<div align="center">
+  <img src="readme_images/full_interface.png" alt="HKN PoliTO Associate Portrait Pipeline interface" width="840" />
+  <br/>
+  <sub>The full pipeline UI — dark editorial theme, live console with per-image timing, CoreML acceleration on macOS.</sub>
+</div>
+
+<br/>
+
 A local batch processor that takes raw associate photos, removes the background, and composites them onto chapter-standard backgrounds. Everything runs on your machine — no data leaves, no accounts, no cloud.
 
 Built for the Mu Nu chapter of IEEE-HKN at Politecnico di Torino.
@@ -163,8 +171,8 @@ No GPU required. CoreML acceleration is optional and kicks in automatically on m
 
 ## License
 
-Copyright 2025 Matteo Sipione  
-Copyright 2025 HKN PoliTO — Mu Nu Chapter, IEEE-HKN, Politecnico di Torino
+Copyright 2026 Matteo Sipione  
+Copyright 2026 HKN PoliTO — Mu Nu Chapter, IEEE-HKN, Politecnico di Torino
 
 Licensed under the Apache License, Version 2.0. See [LICENSE](./LICENSE) for the full text.
 
