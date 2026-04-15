@@ -75,15 +75,13 @@ The sidebar is split into five labeled sections:
 
 ## How the hair edges actually work
 
-Getting clean hair edges on curly or frizzy subjects is the hardest part of this kind of pipeline. The approach here has a few layers:
-
-**Supersampling.** Both ISNet and BiRefNet run at 1024² internally. When the output mask gets upsampled to 2048², you get stair-step artifacts on hair edges. The fix: upsample the input image before passing it to rembg (1.25× standard, 1.5× HQ), let the model run at a proportionally larger effective resolution, then Lanczos-downscale the RGBA output back to the original size. The downscale anti-aliases the stair-steps because neighboring pixels average together.
+The design choice here is "purity first": the raw image goes into matting at full resolution, and whatever pymatting produces is what comes out. No supersampling, no pre-downscale, no detail injection or unsharp masking on top. Earlier iterations stacked all of those to chase crisper wisps, but on dense hair they started amplifying noise and rendering strands as over-sharpened edges.
 
 **Alpha matting.** rembg's `alpha_matting=True` runs pymatting's closed-form solver on the uncertain trimap region. The thresholds are tuned deliberately loose (FG=250, BG=15, erode=30) so the uncertain band is wide. This forces the solver to compute real continuous alpha values on hair wisps instead of inheriting the model's binary mask.
 
-**Alpha gamma lift.** Very fine hair strands — thinner than ~2 pixels in model space — come out of the solver at 5–12% alpha. Lanczos downscaling then pushes them even lower. Applying `α^0.80` before the downscale boosts those values enough that they survive the averaging. Pixels at 10% alpha become 16%, at 5% become ~9%. The fully opaque body of the hair is unaffected since `1.0^0.80 = 1.0`.
+**Full raw resolution.** The raw image is passed to rembg as-is — no pre-downscale, no supersample. At 24 MP inputs this means pymatting solves the alpha matte on tens of millions of pixels, which is slow; on a 2026-era Apple Silicon machine expect a few seconds of matting per image. In return: the trimap "uncertain" band is wide enough in native pixel space that the solver has real texture to work with on curly hair, instead of a bilinear-stretched version of a 1024²-internal mask.
 
-**Color detail injection.** pymatting's foreground color estimator smooths locally, which causes hair wisps to come out as a flat uniform tone even when individual strands are correctly resolved as separate alpha values. The fix: take the decontaminated color (correct base tone, no old-background bleed) and add back high-frequency luminance detail from the original image using an unsharp mask (`detail = I − Gaussian(I, σ=5)`). The Gaussian removes the original background (uniform low-frequency content); what remains is local strand-level variation. That gets added back weighted by alpha so background pixels don't pick it up.
+**Near-one α snap.** The only post-matting touch. Values above 0.992 snap to exactly 1.0 so the opaque body of the subject stays perfectly opaque when composited — nothing else is altered.
 
 ---
 
@@ -118,14 +116,10 @@ All the quality knobs are constants at the top of `pipeline.py`:
 
 | Constant | Default | What it does |
 |---|---|---|
-| `MAX_SIDE` | 2048 | Output resolution cap (px) |
-| `SUPERSAMPLE_STANDARD` | 1.25 | Input upscale factor before rembg in standard mode |
-| `SUPERSAMPLE_HIGH_QUALITY` | 1.5 | Input upscale factor in HQ mode |
-| `MAX_WORK_SIDE` | 2560 | Hard ceiling on working resolution (prevents solver stalls) |
+| `MAX_SIDE` | 2048 | Output canvas resolution cap (px); matting itself runs at full raw resolution |
 | `ALPHA_MATTING_FG` | 250 | Foreground threshold; higher = wider uncertain band |
 | `ALPHA_MATTING_BG` | 15 | Background threshold; lower = wider uncertain band |
-| `ALPHA_MATTING_ERODE` | 30 | Trimap erosion size (px at output resolution) |
-| `ALPHA_LIFT_GAMMA` | 0.80 | Gamma applied to alpha before downscale; lower = stronger wisp lift |
+| `ALPHA_MATTING_ERODE` | 30 | Trimap erosion size (px at raw resolution) |
 | `ALPHA_SNAP_HIGH` | 0.992 | Alpha values above this snap to 1.0 |
 | `SUBJECT_ALPHA_THRESHOLD` | 12 | Alpha (0–255) above which a pixel counts as part of the subject when computing the bounding box for canvas sizing |
 | `FACE_TOP_RATIO` | 0.30 | Target face position from top (canvas may pad above when AR forces it, pushing the face lower — bottom stays anchored) |

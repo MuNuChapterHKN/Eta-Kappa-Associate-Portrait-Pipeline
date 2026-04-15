@@ -3,20 +3,20 @@ HKN PoliTO — Associate ID Photo Pipeline
 Local, GDPR-safe batch processor.
 
 Pipeline (per image):
-    1. Face detection (Mediapipe, CPU)
-    2. Downscale to MAX_SIDE on the longest edge (Lanczos) — no cropping.
-       Background removal runs on the full frame so every subject pixel
-       is available for later composition.
-    3. Background removal (rembg, alpha matting ON) → RGBA with the
-       subject cut out and a transparent background.
-    4. For each output (archival 1:1 and per-background composite):
+    1. Face detection (Mediapipe, CPU).
+    2. Background removal (rembg, alpha matting ON) on the **full-resolution
+       raw** — no pre-downscale, no supersampling. Whatever pymatting
+       produces for each pixel is the colour we keep. The only α
+       post-processing is a near-one snap so the opaque body is perfectly
+       opaque; no detail injection, no unsharp mask, no gamma lift.
+    3. For each output (archival 1:1 and per-background composite):
         · build a transparent canvas at the target aspect ratio that
           contains the whole subject (no crop), with the face horizontally
           centered, at FACE_TOP_RATIO from top when possible, and the
           subject's bottom flush with the canvas bottom
         · paste the subject RGBA at the computed offset
-    5. Archival: save <name>_nobg.png (1:1).
-    6. Composite: cover-fit the background under the canvas and save
+    4. Archival: save <name>_nobg.png (1:1).
+    5. Composite: cover-fit the background under the canvas and save
        <name>_bg_<bgname>_<WxH>.jpg (RGB, q=95).
 
 The subject silhouette is aspect-ratio-invariant: once the background is
@@ -58,50 +58,12 @@ ALPHA_MATTING_FG = 250
 ALPHA_MATTING_BG = 15
 ALPHA_MATTING_ERODE = 30
 
-# Alpha refinement — kept *very* gentle so faint wisps (α ≈ 0.05–0.15) that
-# form the "halo" around the main hair strands survive to the final output.
-# No bilateral filter at all (eats isolated thin strands) and no low snap
-# (would zero the halo). Only a sub-pixel Gaussian and a near-one snap.
-ALPHA_POLISH_SIGMA = 0.3
+# Alpha refinement — kept *very* gentle. The only post-matting touch: snap
+# α values above ALPHA_SNAP_HIGH to exactly 1.0 so the opaque body of the
+# subject doesn't drift to 0.998 / 0.996 from rounding in rembg's pipeline.
+# No Gaussian polish, no low-α snap, no gamma lift — we want pymatting's
+# raw output to show through.
 ALPHA_SNAP_HIGH = 0.992
-
-# Gamma < 1 on α *lifts* low-alpha values: α ^ 0.80 takes 0.10 → 0.16
-# (+60 %) and 0.05 → 0.087 (+74 %) while leaving 1.0 unchanged. This brings
-# back the faint translucent halo of fine hair that the model+Lanczos
-# downscale pipeline tends to attenuate.
-ALPHA_LIFT_GAMMA = 0.80
-
-# Blend window between pymatting's decontaminated foreground colour and the
-# original image RGB, driven by α:
-#   α ≤ DECONTAM_BLEND_LO  → use pymatting's decontaminated colour
-#   α ≥ DECONTAM_BLEND_HI  → use the original RGB directly
-#   in between             → smoothstep blend
-# The decontamination pass smooths locally, which turns dense opaque hair
-# into a flat patch of average tone — losing the clump-level variation that
-# makes hair read as hair. At α ≳ 0.85 the background bleed is negligible
-# (≤ 15 % of the pixel's value), so the original image is already a better
-# estimate of the pure foreground colour than pymatting's smoothed output.
-DECONTAM_BLEND_LO = 0.85
-DECONTAM_BLEND_HI = 0.98
-
-# Detail-injection scale for mid-α pixels. The original unsharp-mask detail
-# is added on top of the base colour, gated so pure-background pixels don't
-# pick it up. Alpha-gated with a gentler curve (sqrt) than before so dense
-# hair keeps its texture instead of being muted to α× its real variation.
-DETAIL_INJECT_STRENGTH = 0.9
-DETAIL_GAUSSIAN_SIGMA = 8.0  # up from 5 — captures clump-level variation too
-
-# Supersampling factors — the matting model runs at 1024² internally.
-# Processing the input at >1× and Lanczos-downsampling the resulting RGBA
-# anti-aliases the stair-step artifacts from the model's mask upscaling.
-# Capped by MAX_WORK_SIDE below so pymatting doesn't stall on huge images.
-SUPERSAMPLE_STANDARD = 1.25  # modest slowdown, clean edges
-SUPERSAMPLE_HIGH_QUALITY = 1.5  # stronger AA, noticeable slowdown
-
-# Hard ceiling on the working resolution passed to rembg + pymatting.
-# Above ~2560 the alpha-matting solver stalls (minutes per image) with
-# no intermediate feedback, which looks to the user like a hang.
-MAX_WORK_SIDE = 2560
 
 FACE_TOP_RATIO = 0.30  # face vertical position in crop (from top), universal
 PORTRAIT_FACE_TOP_RATIO = FACE_TOP_RATIO  # backward-compat alias
@@ -554,25 +516,6 @@ def canvas_for_ar(
     return canvas
 
 
-def _downscale_for_matting(image_bgr, face_x: int, face_y: int, max_side: int = MAX_SIDE):
-    """
-    Lanczos-downscale the raw image so its longest edge is ≤ ``max_side``.
-    No cropping — every subject pixel stays available for the canvas step
-    that runs after background removal. Returns ``(image, (face_x, face_y))``
-    with face coords mapped into the downscaled space.
-    """
-    import cv2
-    h, w = image_bgr.shape[:2]
-    longest = max(w, h)
-    if longest <= max_side:
-        return image_bgr, (int(face_x), int(face_y))
-    scale = max_side / longest
-    new_w = max(1, int(round(w * scale)))
-    new_h = max(1, int(round(h * scale)))
-    out = cv2.resize(image_bgr, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
-    return out, (int(round(face_x * scale)), int(round(face_y * scale)))
-
-
 def ar_label(width: int, height: int, max_denom: int = 20) -> str:
     """
     Produce a human-readable aspect-ratio tag like ``"16x9"`` or ``"3x2"``.
@@ -595,83 +538,44 @@ def _refine_alpha(rgba):
     """
     Minimal alpha refinement — run *after* alpha matting.
 
-        1. Sub-pixel Gaussian polish: light dithering of pixel-boundary
-           stair-steps.
-        2. Snap near-one to exact 1 (keeps the opaque body perfectly
-           opaque without affecting any translucent pixel).
+        Snap α values above ALPHA_SNAP_HIGH to exactly 1.0 so the opaque
+        body is perfectly opaque (without that, rembg's pipeline leaves
+        α ≈ 0.996 on the body, which can subtly tint it against bright
+        backgrounds during compositing).
 
-    Intentionally does **not** bilateral-filter or low-snap α: both erase
-    the faint wisps (α in ~5-15 %) that surround the main hair strands and
-    are what separate "cutout" from "photoreal".
+    Intentionally does **not** touch anything else: no Gaussian polish,
+    no bilateral filter, no low-α snap. Whatever pymatting computed for a
+    pixel is what reaches the output — "purity first" is the design goal
+    for this stage.
     """
     import numpy as np
-    import cv2
     from PIL import Image
 
     arr = np.array(rgba)  # H×W×4 uint8
-    alpha = arr[..., 3]
-
-    # 1. sub-pixel Gaussian polish
-    k = max(3, int(ALPHA_POLISH_SIGMA * 6) | 1)
-    alpha = cv2.GaussianBlur(
-        alpha.astype(np.float32),
-        (k, k),
-        sigmaX=ALPHA_POLISH_SIGMA,
-        sigmaY=ALPHA_POLISH_SIGMA,
-    )
-
-    # 2. snap only near-one (keep faint wisps alive)
-    a = alpha / 255.0
+    a = arr[..., 3].astype(np.float32) / 255.0
     a = np.where(a > ALPHA_SNAP_HIGH, 1.0, a)
     arr[..., 3] = np.clip(a * 255.0 + 0.5, 0, 255).astype(np.uint8)
-
     return Image.fromarray(arr, "RGBA")
 
 
 def remove_background(
     image_bgr,
     model_name: str = DEFAULT_MODEL,
-    supersample: float = SUPERSAMPLE_STANDARD,
 ):
     """
-    Run rembg with supersampling + alpha matting + multi-stage α refinement.
+    Run rembg + alpha matting on the **full-resolution** input with no
+    pre-processing beyond BGR→RGB and no post-processing beyond the α-snap
+    in ``_refine_alpha``. No supersampling, no downscaling, no detail
+    injection, no unsharp mask, no gamma lift.
 
-    The model runs at its fixed internal resolution (1024² for
-    isnet / birefnet, 320² for u2net), so the output mask is always a
-    bilinear upsample of that internal result. Processing at ``supersample ×``
-    the target resolution and Lanczos-downsampling the RGBA afterwards
-    anti-aliases those upsampling steps.
+    The rembg output (pymatting-decontaminated RGB + α-matted alpha) flows
+    through to the canvas step untouched.
     """
     import cv2
     from PIL import Image
     from rembg import remove
 
-    orig_h, orig_w = image_bgr.shape[:2]
-
-    # --- 1. supersample input, but cap so pymatting doesn't stall ---------
-    eff_supersample = supersample
-    if supersample > 1.0:
-        longest = max(orig_w, orig_h)
-        if longest * supersample > MAX_WORK_SIDE:
-            eff_supersample = MAX_WORK_SIDE / longest
-
-    if eff_supersample > 1.0:
-        ss_w = int(round(orig_w * eff_supersample))
-        ss_h = int(round(orig_h * eff_supersample))
-        work_bgr = cv2.resize(
-            image_bgr, (ss_w, ss_h), interpolation=cv2.INTER_LANCZOS4
-        )
-    else:
-        work_bgr = image_bgr
-
-    # --- 2. rembg + alpha matting -----------------------------------------
-    # Scale erode_size with the *effective* factor so the matting band
-    # covers the same relative region in input-space regardless of scale.
-    erode_size = max(3, int(round(ALPHA_MATTING_ERODE * max(1.0, eff_supersample))))
-
-    import numpy as np
-
-    rgb = cv2.cvtColor(work_bgr, cv2.COLOR_BGR2RGB)
+    rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
     pil = Image.fromarray(rgb)
     session = get_rembg_session(model_name)
     out = remove(
@@ -680,78 +584,8 @@ def remove_background(
         alpha_matting=True,
         alpha_matting_foreground_threshold=ALPHA_MATTING_FG,
         alpha_matting_background_threshold=ALPHA_MATTING_BG,
-        alpha_matting_erode_size=erode_size,
+        alpha_matting_erode_size=ALPHA_MATTING_ERODE,
     ).convert("RGBA")
-
-    # --- 3. foreground colour: α-blended base + high-pass detail ----------
-    # pymatting's foreground-ML estimator solves for the *pure* foreground
-    # colour at each pixel, which is mandatory for semi-transparent hair
-    # wisps (where the original pixel is a mix of hair and old background).
-    # But the estimator smooths its output locally, so dense opaque hair
-    # loses its clump-level variation and reads as a flat patch.
-    #
-    # Two-part fix:
-    #
-    # (a) α-blended BASE COLOUR. At α ≈ 1 the original pixel already is
-    #     the pure foreground colour (the old bg contributes ≤ 2 %), so use
-    #     the original directly — no smoothing. Between DECONTAM_BLEND_LO
-    #     and DECONTAM_BLEND_HI we smoothstep-fade from decontaminated
-    #     (needed for semi-transparent edges) to original (safe for dense
-    #     opaque content). This recovers hair texture in the back without
-    #     reintroducing bg bleed at the wispy edges.
-    #
-    # (b) UNSHARP-MASK DETAIL INJECTION on top. σ = DETAIL_GAUSSIAN_SIGMA
-    #     isolates everything from strand-level (1–2 px) up to clump-level
-    #     (~16 px) variation. Added weighted by √α so mid-α hair gets most
-    #     of its texture back instead of being muted to α× its real signal,
-    #     while α=0 pixels still stay clean.
-    out_arr = np.array(out, dtype=np.uint8)
-    alpha_f = out_arr[..., 3:4].astype(np.float32) / 255.0
-
-    orig_rgb_f = rgb.astype(np.float32)
-    decontam_rgb_f = out_arr[..., :3].astype(np.float32)
-
-    # Smoothstep blend between decontaminated and original, driven by α.
-    lo, hi = DECONTAM_BLEND_LO, DECONTAM_BLEND_HI
-    t = np.clip((alpha_f - lo) / (hi - lo), 0.0, 1.0)
-    blend_w = t * t * (3.0 - 2.0 * t)  # smoothstep → 0..1
-    base_rgb_f = decontam_rgb_f * (1.0 - blend_w) + orig_rgb_f * blend_w
-
-    # Unsharp mask on the ORIGINAL: local variation, background-safe because
-    # the uniform old bg is (by construction) the dominant low-frequency
-    # content that the Gaussian removes.
-    blur = cv2.GaussianBlur(
-        orig_rgb_f, ksize=(0, 0),
-        sigmaX=DETAIL_GAUSSIAN_SIGMA, sigmaY=DETAIL_GAUSSIAN_SIGMA,
-    )
-    detail = orig_rgb_f - blur  # ∈ [-~80, +~80] practically
-
-    # √α gating: at α=1 full detail, at α=0.25 still 50 % detail, at α=0
-    # exactly zero. Much gentler than the old linear-α gating that muted
-    # mid-α hair to its own α-fraction.
-    detail_gain = np.sqrt(np.clip(alpha_f, 0.0, 1.0)) * DETAIL_INJECT_STRENGTH
-    enriched = base_rgb_f + detail * detail_gain
-
-    # --- 3b. α gamma-lift: rescue faint wisps -----------------------------
-    # The model runs at 1024² internally; wisps thinner than ~2 model pixels
-    # come out with very low α (~8-12 %). Lanczos downscale then averages
-    # them toward 0. Applying α ← α^0.80 *before* the downscale boosts those
-    # faint values so they survive averaging, restoring the halo of fine
-    # hair visible in the source photo.
-    alpha_ch = out_arr[..., 3].astype(np.float32) / 255.0
-    alpha_ch = np.power(alpha_ch, ALPHA_LIFT_GAMMA)
-    out_arr[..., 3] = np.clip(alpha_ch * 255.0 + 0.5, 0, 255).astype(np.uint8)
-    out_arr[..., :3] = np.clip(enriched, 0, 255).astype(np.uint8)
-    out = Image.fromarray(out_arr, "RGBA")
-
-    # --- 4. Lanczos downscale back to target size -------------------------
-    # This is where the stair-step anti-aliasing actually happens: 4 pixels
-    # of the supersampled RGBA collapse into 1 pixel of output, averaging
-    # the jaggies. With the α gamma-lift above, faint wisps survive this.
-    if out.size != (orig_w, orig_h):
-        out = out.resize((orig_w, orig_h), Image.LANCZOS)
-
-    # --- 5. multi-stage α refinement --------------------------------------
     return _refine_alpha(out)
 
 
@@ -818,7 +652,6 @@ def process_batch(
     backgrounds: List[Tuple[str, bytes]],
     on_progress: Optional[ProgressFn] = None,
     model_name: str = DEFAULT_MODEL,
-    supersample: float = SUPERSAMPLE_STANDARD,
     on_start: Optional[StartFn] = None,
 ) -> List[ItemResult]:
     """
@@ -877,29 +710,18 @@ def process_batch(
             fx, fy, detected = detect_face_center(raw)
             stage_times["face"] = time.perf_counter() - t0
 
-            # Downscale (not crop) the raw to bound matting cost. Every
-            # subject pixel stays available, so when an output canvas has a
-            # very different aspect ratio from the input, padding — not
-            # cropping — absorbs the mismatch. Face coords follow the scale.
+            # Matting runs on the raw, full resolution. No pre-downscale, no
+            # supersampling — whatever the raw is, pymatting sees. Face coords
+            # stay in raw space for the canvas step below.
             t0 = time.perf_counter()
-            framed, (face_in_frame_x, face_in_frame_y) = _downscale_for_matting(
-                raw, fx, fy
-            )
-            stage_times["crop"] = time.perf_counter() - t0
-
-            t0 = time.perf_counter()
-            subject = remove_background(
-                framed, model_name=model_name, supersample=supersample
-            )
+            subject = remove_background(raw, model_name=model_name)
             stage_times["matting"] = time.perf_counter() - t0
 
             # Archival 1:1 PNG — same canvas algorithm as the composites so
             # the 1:1 nobg and any 1:1 background output share identical
             # framing of the subject (only the background layer differs).
             t0 = time.perf_counter()
-            nobg_canvas = canvas_for_ar(
-                subject, face_in_frame_x, face_in_frame_y, 1.0
-            )
+            nobg_canvas = canvas_for_ar(subject, fx, fy, 1.0)
             nobg_name = f"{img_path.stem}_nobg.png"
             nobg_canvas.save(output_dir / nobg_name, format="PNG", optimize=True)
             produced.append(nobg_name)
@@ -910,9 +732,7 @@ def process_batch(
             # can tell variants apart at a glance.
             t0 = time.perf_counter()
             for bg_name, bg_pil, bg_ar, bg_ar_tag in bg_items:
-                subject_for_bg = canvas_for_ar(
-                    subject, face_in_frame_x, face_in_frame_y, bg_ar
-                )
+                subject_for_bg = canvas_for_ar(subject, fx, fy, bg_ar)
                 composed = composite_on_background(subject_for_bg, bg_pil)
                 out_name = f"{img_path.stem}_bg_{bg_name}_{bg_ar_tag}.jpg"
                 composed.save(

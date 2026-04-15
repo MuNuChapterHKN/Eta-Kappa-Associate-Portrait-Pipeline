@@ -25,8 +25,6 @@ from pipeline import (
     DEFAULT_MODEL,
     HIGH_QUALITY_MODEL,
     ItemResult,
-    SUPERSAMPLE_HIGH_QUALITY,
-    SUPERSAMPLE_STANDARD,
     VALID_EXT,
     list_images,
     prewarm,
@@ -707,9 +705,6 @@ def main():
 
         high_quality = bool(st.session_state.get("high_quality"))
         model_name = HIGH_QUALITY_MODEL if high_quality else DEFAULT_MODEL
-        supersample_factor = (
-            SUPERSAMPLE_HIGH_QUALITY if high_quality else SUPERSAMPLE_STANDARD
-        )
 
         # ---- warm-up with live status ------------------------------------
         try:
@@ -731,7 +726,7 @@ def main():
         push_log(
             "info",
             f'Matting model · <span class="path">{html.escape(model_name)}</span>'
-            f' · supersample <span class="path">{supersample_factor:.2f}×</span>',
+            f' · full-res, no supersample',
         )
 
         bgs: List[tuple] = []
@@ -853,7 +848,6 @@ def main():
                 on_progress=on_progress,
                 on_start=on_start,
                 model_name=model_name,
-                supersample=supersample_factor,
             )
             wall = time.perf_counter() - batch_t0
             processed = ok_count + err_count
