@@ -139,4 +139,35 @@ No GPU required. CoreML acceleration is optional and kicks in automatically on m
 
 ---
 
+## Credits
+
+**Author:** Matteo Sipione — [matteo@sipio.it](mailto:matteo@sipio.it)
+
+**Organization:** HKN PoliTO — Mu Nu Chapter, IEEE-HKN, Politecnico di Torino
+
+**Third-party libraries this tool is built on:**
+
+| Library | What it does here |
+|---|---|
+| [rembg](https://github.com/danielgatis/rembg) | Background removal, alpha matting, model management |
+| [pymatting](https://github.com/pymatting/pymatting) | Closed-form alpha matting solver |
+| [Mediapipe](https://github.com/google-ai-edge/mediapipe) | Face detection |
+| [onnxruntime](https://github.com/microsoft/onnxruntime) | ONNX model inference, CoreML backend on macOS |
+| [OpenCV](https://github.com/opencv/opencv) | Image I/O, Haar cascade fallback, color conversion |
+| [Pillow](https://github.com/python-pillow/Pillow) | Image compositing, resampling, format export |
+| [NumPy](https://github.com/numpy/numpy) | Alpha channel math, detail injection |
+| [Streamlit](https://github.com/streamlit/streamlit) | UI framework |
+| [scikit-image](https://github.com/scikit-image/scikit-image) | Image utilities |
+
+---
+
+## License
+
+Copyright 2025 Matteo Sipione  
+Copyright 2025 HKN PoliTO — Mu Nu Chapter, IEEE-HKN, Politecnico di Torino
+
+Licensed under the Apache License, Version 2.0. See [LICENSE](./LICENSE) for the full text.
+
+---
+
 *Mu Nu Chapter · IEEE-HKN · Politecnico di Torino*
