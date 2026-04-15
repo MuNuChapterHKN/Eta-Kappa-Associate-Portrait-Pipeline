@@ -1,0 +1,95 @@
+# ---------------------------------------------------------------------------
+# HKN PoliTO · Associate Portrait Pipeline — .gitignore
+# ---------------------------------------------------------------------------
+
+# --- Python runtime --------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# --- Virtual environment (run.sh builds this locally) ----------------------
+venv/
+.venv/
+env/
+.env
+ENV/
+
+# --- Streamlit -------------------------------------------------------------
+.streamlit/secrets.toml
+.streamlit/cache/
+
+# --- Model weights (downloaded at runtime, never commit) -------------------
+# rembg caches models in ~/.u2net/ by default, but if U2NET_HOME is set to a
+# project-local path we want to ignore it.
+*.onnx
+*.pth
+*.pt
+.u2net/
+u2net/
+models/
+.cache/
+
+# --- Outputs / user data (GDPR) --------------------------------------------
+# Portraits are personal data — never commit any sample or test output.
+output/
+outputs/
+out/
+samples/
+test_images/
+test_output/
+*_nobg.png
+*_bg_*.jpg
+*_bg_*.jpeg
+
+# --- IDE / editors ---------------------------------------------------------
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.spyderproject
+.spyproject
+.ropeproject
+
+# --- OS cruft --------------------------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+
+# --- Test / coverage -------------------------------------------------------
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+.mypy_cache/
+.ruff_cache/
+
+# --- Jupyter ---------------------------------------------------------------
+.ipynb_checkpoints/
+*.ipynb
+
+# --- Local config / logs ---------------------------------------------------
+*.log
+*.local
+.env.local
+.env.*.local
