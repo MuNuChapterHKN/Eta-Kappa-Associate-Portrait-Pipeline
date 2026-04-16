@@ -33,12 +33,53 @@ user actually clicks "Begin processing".
 
 from __future__ import annotations
 
-import io
 import os
+
+
+# Numba's default "workqueue" threading layer is NOT re-entrant: when two
+# Python threads enter an @njit(parallel=True) region at once (which is
+# exactly what happens when our ThreadPoolExecutor calls pymatting's
+# closed-form solver on multiple images concurrently) it calls abort()
+# and takes the whole process down. Fix requires a thread-safe backend
+# ("tbb" or "omp"), but those backends need an *external* package that
+# numba's wheels don't bundle — and neither is currently distributed on
+# PyPI for macOS arm64. So we probe at import time: if a threadsafe
+# backend is installed, point numba at it and let matting run in
+# parallel; otherwise fall back to a module-level lock that serialises
+# the `rembg.remove()` call across worker threads. The lock costs us
+# the overlap on pymatting itself but keeps decode / face detection /
+# canvas / bilateral / α-blend / save-to-disk running concurrently,
+# which is still a net win on 2–4 workers.
+def _probe_threadsafe_numba_backend() -> "str | None":
+    """Return 'tbb', 'omp', or None.
+
+    Runs *before* any numba import so the NUMBA_THREADING_LAYER env var
+    can be set up correctly. Only checks whether the supporting package
+    for each backend can be imported — numba itself picks the layer at
+    its own initialisation time based on what's available.
+    """
+    for mod_name, layer_name in (("tbb", "tbb"), ("omp", "omp")):
+        try:
+            __import__(mod_name)
+            return layer_name
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
+_NUMBA_THREADSAFE_LAYER = _probe_threadsafe_numba_backend()
+if _NUMBA_THREADSAFE_LAYER:
+    os.environ.setdefault("NUMBA_THREADING_LAYER", _NUMBA_THREADSAFE_LAYER)
+# else: let numba pick the default ("workqueue") and we'll guard
+# pymatting calls with a lock instead — see _matting_lock below.
+
+import io
 import platform
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+_matting_lock = threading.Lock()
 from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
@@ -116,7 +157,7 @@ def _detect_total_ram_gb() -> Optional[float]:
         if hasattr(os, "sysconf") and "SC_PHYS_PAGES" in os.sysconf_names:
             pages = os.sysconf("SC_PHYS_PAGES")
             page_size = os.sysconf("SC_PAGE_SIZE")
-            return pages * page_size / (1024 ** 3)
+            return pages * page_size / (1024**3)
     except Exception:
         pass
     return None
@@ -226,15 +267,11 @@ def get_rembg_session(model_name: str = DEFAULT_MODEL):
         # CoreML at graph-build time instead of falling through — drop to
         # CPU-only so the user still gets a working pipeline.
         try:
-            _rembg_sessions[model_name] = new_session(
-                model_name, providers=providers
-            )
+            _rembg_sessions[model_name] = new_session(model_name, providers=providers)
             _active_providers = providers
         except Exception:
             cpu_only = ["CPUExecutionProvider"]
-            _rembg_sessions[model_name] = new_session(
-                model_name, providers=cpu_only
-            )
+            _rembg_sessions[model_name] = new_session(model_name, providers=cpu_only)
             _active_providers = cpu_only
     return _rembg_sessions[model_name]
 
@@ -276,6 +313,7 @@ def get_face_detector() -> Tuple[object, str]:
 
     # --- attempt 2: OpenCV Haar cascade (always available) ----------------
     import cv2
+
     cascade = Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml"
     det = cv2.CascadeClassifier(str(cascade))
     if det.empty():
@@ -296,6 +334,7 @@ def prewarm(
     Eagerly import heavy deps + build models so subsequent calls are fast.
     Designed to be wrapped in ``st.status()`` so the UI stays responsive.
     """
+
     def _step(msg: str) -> None:
         if on_step is not None:
             on_step(msg)
@@ -330,6 +369,41 @@ def prewarm(
         tag = "Metal / ANE" if "CoreMLExecutionProvider" in providers else "CPU only"
         _step(f"→ onnxruntime providers: {' + '.join(providers)}  ({tag})")
 
+    # Surface numba's actual threading layer. pymatting's parallel solver
+    # will only be thread-safe across our worker pool if this lands on
+    # "omp" or "tbb" — "workqueue" (the default) will abort the process
+    # as soon as a second thread enters a parallel region.
+    try:
+        import numba  # pymatting → numba; safe to import now
+
+        # force-init the threading layer by running a trivial parallel
+        # kernel; numba.threading_layer() raises until that's happened.
+        try:
+            from numba import njit, prange
+
+            @njit(parallel=True, cache=False)
+            def _probe():
+                total = 0
+                for i in prange(2):
+                    total += i
+                return total
+
+            _probe()
+            layer = numba.threading_layer()
+        except Exception:
+            layer = "unknown (probe failed)"
+        if layer in ("omp", "tbb"):
+            _step(f"→ numba threading layer: {layer} (thread-safe, parallel workers OK)")
+        else:
+            _step(
+                f"→ numba threading layer: {layer} · WARNING: not thread-safe, "
+                "set max_workers=1 or export NUMBA_THREADING_LAYER=omp"
+            )
+    except Exception:
+        # numba not installed (shouldn't happen — pymatting needs it) or
+        # failed to import; nothing actionable to surface.
+        pass
+
     _step("Ready")
 
 
@@ -339,6 +413,7 @@ def prewarm(
 def detect_face_center(image_bgr) -> Tuple[int, int, bool]:
     """Return (face_x, face_y, detected). Backend-agnostic."""
     import cv2
+
     h, w = image_bgr.shape[:2]
     detector, backend = get_face_detector()
 
@@ -348,8 +423,10 @@ def detect_face_center(image_bgr) -> Tuple[int, int, bool]:
         if results.detections:
             best = max(
                 results.detections,
-                key=lambda d: d.location_data.relative_bounding_box.width
-                * d.location_data.relative_bounding_box.height,
+                key=lambda d: (
+                    d.location_data.relative_bounding_box.width
+                    * d.location_data.relative_bounding_box.height
+                ),
             )
             bbox = best.location_data.relative_bounding_box
             cx = int((bbox.xmin + bbox.width / 2) * w)
@@ -403,6 +480,7 @@ def smart_crop_to_ar(
     Returns ``(crop_bgr, (face_x_in_crop, face_y_in_crop))``.
     """
     import cv2
+
     h, w = image_bgr.shape[:2]
     fty = face_top_ratio
 
@@ -466,6 +544,7 @@ def _subject_bbox(subject_rgba, alpha_threshold: int = SUBJECT_ALPHA_THRESHOLD):
     leaves some opaque content for a real portrait).
     """
     import numpy as np
+
     arr = np.asarray(subject_rgba)
     if arr.ndim != 3 or arr.shape[2] < 4:
         h, w = arr.shape[:2]
@@ -525,6 +604,7 @@ def canvas_for_ar(
     much padding we added.
     """
     from PIL import Image
+
     sx0, sy0, sx1, sy1 = _subject_bbox(subject_rgba)
     sw = max(1, sx1 - sx0)
     sh = max(1, sy1 - sy0)
@@ -653,14 +733,15 @@ def remove_background(
     rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
     pil = Image.fromarray(rgb)
     session = get_rembg_session(model_name)
-    out = remove(
-        pil,
-        session=session,
-        alpha_matting=True,
-        alpha_matting_foreground_threshold=ALPHA_MATTING_FG,
-        alpha_matting_background_threshold=ALPHA_MATTING_BG,
-        alpha_matting_erode_size=ALPHA_MATTING_ERODE,
-    ).convert("RGBA")
+    with _matting_lock:
+        out = remove(
+            pil,
+            session=session,
+            alpha_matting=True,
+            alpha_matting_foreground_threshold=ALPHA_MATTING_FG,
+            alpha_matting_background_threshold=ALPHA_MATTING_BG,
+            alpha_matting_erode_size=ALPHA_MATTING_ERODE,
+        ).convert("RGBA")
 
     # Bilateral-smooth the original RGB to damp JPEG quantisation blocks
     # without touching strand edges. This is run on the *original* image
@@ -695,6 +776,7 @@ def remove_background(
 def fit_background(bg_pil, target_size: Tuple[int, int]):
     """Cover-fit: resize keeping aspect, center-crop to target."""
     from PIL import Image
+
     tw, th = target_size
     bg = bg_pil.convert("RGB")
     bw, bh = bg.size
@@ -708,6 +790,7 @@ def fit_background(bg_pil, target_size: Tuple[int, int]):
 
 def composite_on_background(subject_rgba, bg_rgb):
     from PIL import Image
+
     bg = fit_background(bg_rgb, subject_rgba.size).convert("RGBA")
     composed = Image.alpha_composite(bg, subject_rgba)
     return composed.convert("RGB")
@@ -719,13 +802,7 @@ def composite_on_background(subject_rgba, bg_rgb):
 def list_images(folder: Path) -> List[Path]:
     if not folder.exists() or not folder.is_dir():
         return []
-    return sorted(
-        [
-            p
-            for p in folder.iterdir()
-            if p.is_file() and p.suffix.lower() in VALID_EXT
-        ]
-    )
+    return sorted([p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in VALID_EXT])
 
 
 @dataclass
@@ -801,9 +878,7 @@ def _process_one_image(
 
     try:
         t0 = time.perf_counter()
-        raw = cv2.imdecode(
-            np.fromfile(str(img_path), dtype=np.uint8), cv2.IMREAD_COLOR
-        )
+        raw = cv2.imdecode(np.fromfile(str(img_path), dtype=np.uint8), cv2.IMREAD_COLOR)
         if raw is None:
             raise ValueError("cannot decode image (unsupported or corrupted)")
         stage_times["decode"] = time.perf_counter() - t0
@@ -846,19 +921,29 @@ def _process_one_image(
             produced.append(out_name)
         stage_times["composite"] = time.perf_counter() - t0
 
-        detail = (
-            "face detected" if detected else "no face found → centered fallback"
-        )
+        detail = "face detected" if detected else "no face found → centered fallback"
         elapsed = time.perf_counter() - t_start
         return ItemResult(
-            idx, total, img_path.name, True, detail, produced,
-            elapsed_s=elapsed, stage_times=stage_times,
+            idx,
+            total,
+            img_path.name,
+            True,
+            detail,
+            produced,
+            elapsed_s=elapsed,
+            stage_times=stage_times,
         )
     except Exception as e:  # noqa: BLE001
         elapsed = time.perf_counter() - t_start
         return ItemResult(
-            idx, total, img_path.name, False, str(e), produced,
-            elapsed_s=elapsed, stage_times=stage_times,
+            idx,
+            total,
+            img_path.name,
+            False,
+            str(e),
+            produced,
+            elapsed_s=elapsed,
+            stage_times=stage_times,
         )
 
 
@@ -953,7 +1038,10 @@ def process_batch(
         if skip_existing and _all_outputs_present(img_path, bg_items, output_dir):
             outs = _expected_outputs(img_path, bg_items)
             skip_res = ItemResult(
-                idx, total, img_path.name, True,
+                idx,
+                total,
+                img_path.name,
+                True,
                 "already processed · skipped",
                 outs,
                 elapsed_s=0.0,
@@ -979,9 +1067,7 @@ def process_batch(
         # on_start callbacks (safe because we're on the main thread).
         for idx, img_path in to_process:
             _fire_start(idx, img_path.name)
-            res = _process_one_image(
-                idx, total, img_path, output_dir, bg_items, model_name
-            )
+            res = _process_one_image(idx, total, img_path, output_dir, bg_items, model_name)
             results.append(res)
             _fire_progress(res)
     else:
@@ -991,24 +1077,24 @@ def process_batch(
         # UI in an undefined state. on_progress is still fired here (main
         # thread) as each future completes.
         def _run(idx: int, img_path: Path) -> ItemResult:
-            return _process_one_image(
-                idx, total, img_path, output_dir, bg_items, model_name
-            )
+            return _process_one_image(idx, total, img_path, output_dir, bg_items, model_name)
 
-        with ThreadPoolExecutor(
-            max_workers=workers, thread_name_prefix="hkn-worker"
-        ) as ex:
-            futures = {
-                ex.submit(_run, idx, p): (idx, p) for idx, p in to_process
-            }
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="hkn-worker") as ex:
+            futures = {ex.submit(_run, idx, p): (idx, p) for idx, p in to_process}
             for fut in as_completed(futures):
                 idx, img_path = futures[fut]
                 try:
                     res = fut.result()
                 except Exception as e:  # noqa: BLE001
                     res = ItemResult(
-                        idx, total, img_path.name, False, str(e), [],
-                        elapsed_s=0.0, stage_times={},
+                        idx,
+                        total,
+                        img_path.name,
+                        False,
+                        str(e),
+                        [],
+                        elapsed_s=0.0,
+                        stage_times={},
                     )
                 results.append(res)
                 _fire_progress(res)
@@ -1019,8 +1105,6 @@ def process_batch(
 
     if bg_errors and on_progress is not None:
         for msg in bg_errors:
-            on_progress(
-                ItemResult(0, total, "(backgrounds)", False, msg, [])
-            )
+            on_progress(ItemResult(0, total, "(backgrounds)", False, msg, []))
 
     return results

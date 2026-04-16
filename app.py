@@ -5,6 +5,9 @@ Streamlit GUI, local processing, GDPR-safe.
 
 from __future__ import annotations
 
+# pipeline.py handles NUMBA_THREADING_LAYER selection automatically
+# (probes for tbb/omp, falls back to workqueue with a lock on macOS Metal)
+
 import base64
 import datetime as dt
 import html
@@ -105,7 +108,7 @@ def _pick_directory_macos(initial: str = "") -> Optional[str]:
 
     script = (
         'tell application "System Events" to activate\n'
-        f'POSIX path of (choose folder with prompt '
+        f"POSIX path of (choose folder with prompt "
         f'"Select folder — HKN PoliTO"{default})'
     )
 
@@ -196,6 +199,7 @@ def _pick_directory(initial: str = "") -> Optional[str]:
 def _browse_cb(key: str, flash_key: str):
     """Callback factory: opens picker, writes the choice into session state.
     Stores a status message in ``flash_key`` so the UI can surface failures."""
+
     def _cb():
         picked = _pick_directory(st.session_state.get(key, ""))
         if picked:
@@ -211,6 +215,7 @@ def _browse_cb(key: str, flash_key: str):
                     "check behind the browser window or paste the path "
                     "manually above."
                 )
+
     return _cb
 
 
@@ -271,8 +276,7 @@ def render_background_previews(uploads, sidebar) -> None:
         return
     n = len(uploads)
     sidebar.markdown(
-        f'<div class="hkn-bg-preview-label">Selected'
-        f'<span class="count">· {n:02d}</span></div>',
+        f'<div class="hkn-bg-preview-label">Selected<span class="count">· {n:02d}</span></div>',
         unsafe_allow_html=True,
     )
 
@@ -285,15 +289,15 @@ def render_background_previews(uploads, sidebar) -> None:
             if uri
             else '<div class="thumb placeholder"></div>'
         )
-        dim = f'{w} × {h}' if w and h else '—'
+        dim = f"{w} × {h}" if w and h else "—"
         chips_html.append(
             f'<div class="hkn-bg-chip">'
-            f'{thumb_el}'
+            f"{thumb_el}"
             f'<div class="meta">'
             f'<span class="name" title="{html.escape(f.name)}">{html.escape(f.name)}</span>'
             f'<span class="dim">{dim} · {kb} KB</span>'
-            f'</div>'
-            f'</div>'
+            f"</div>"
+            f"</div>"
         )
     sidebar.markdown(
         f'<div class="hkn-bg-chips">{"".join(chips_html)}</div>',
@@ -309,9 +313,7 @@ def render_background_previews(uploads, sidebar) -> None:
 
 
 def push_log(kind: str, msg_html: str) -> None:
-    st.session_state["log"].append(
-        {"ts": now_ts(), "kind": kind, "msg": msg_html}
-    )
+    st.session_state["log"].append({"ts": now_ts(), "kind": kind, "msg": msg_html})
 
 
 # ---------------------------------------------------------------------------
@@ -331,6 +333,7 @@ def ensure_models_ready(model_name: str) -> None:
         expanded=True,
         state="running",
     ) as status:
+
         def _step(msg: str) -> None:
             status.write(f"**›** {msg}")
 
@@ -363,7 +366,7 @@ def render_sidebar():
     logo = _logo_data_uri()
     brand_html = f"""
     <div class="hkn-side-brand">
-        {f'<img class="logo" src="{logo}" alt="HKN PoliTO" />' if logo else ''}
+        {f'<img class="logo" src="{logo}" alt="HKN PoliTO" />' if logo else ""}
         <div class="chapter">IEEE · Eta Kappa Nu<br/><b>Mu Nu Chapter</b></div>
         <div class="tag">Politecnico di Torino · Since 2017</div>
     </div>
@@ -450,8 +453,8 @@ def render_sidebar():
     st.sidebar.markdown(
         '<div class="hkn-side-hint">Standard: <code>isnet-general-use</code> '
         '(~175 MB, fast). <b style="color:var(--gold)">High quality</b>: '
-        '<code>birefnet-portrait</code> (~440 MB first-time download, slower, '
-        'but noticeably cleaner hair edges on curly / frizzy subjects).</div>',
+        "<code>birefnet-portrait</code> (~440 MB first-time download, slower, "
+        "but noticeably cleaner hair edges on curly / frizzy subjects).</div>",
         unsafe_allow_html=True,
     )
     st.sidebar.toggle(
@@ -467,9 +470,9 @@ def render_sidebar():
     )
     st.sidebar.markdown(
         '<div class="hkn-side-hint">Workers processing images in parallel. '
-        '2 is a safe default: one in ANE/GPU inference while another is in '
-        'CPU matting. Each worker can peak at 3–5&nbsp;GB on a 24&nbsp;MP '
-        'input, so the cap is tuned to your machine\'s CPU and RAM.</div>',
+        "2 is a safe default: one in ANE/GPU inference while another is in "
+        "CPU matting. Each worker can peak at 3–5&nbsp;GB on a 24&nbsp;MP "
+        "input, so the cap is tuned to your machine's CPU and RAM.</div>",
         unsafe_allow_html=True,
     )
     st.sidebar.number_input(
@@ -486,9 +489,9 @@ def render_sidebar():
     )
     st.sidebar.markdown(
         '<div class="hkn-side-hint">Resume skips any input whose outputs '
-        '(archival PNG + every current background composite) are already '
-        'on disk. Matching is by filename only — rename, delete, or change '
-        'backgrounds to force reprocessing.</div>',
+        "(archival PNG + every current background composite) are already "
+        "on disk. Matching is by filename only — rename, delete, or change "
+        "backgrounds to force reprocessing.</div>",
         unsafe_allow_html=True,
     )
     st.sidebar.checkbox(
@@ -627,9 +630,9 @@ def render_log(container):
     if not rows:
         container.markdown(
             '<div class="hkn-log"><div class="hkn-log-empty">'
-            'The console is silent. Configure the run in the sidebar '
-            'and press <b>Begin processing</b>.'
-            '</div></div>',
+            "The console is silent. Configure the run in the sidebar "
+            "and press <b>Begin processing</b>."
+            "</div></div>",
             unsafe_allow_html=True,
         )
         return
@@ -647,7 +650,7 @@ def render_log(container):
             f'<span class="ts">{r["ts"]}</span>'
             f'<span class="{glyph_cls}">{glyph}</span>'
             f'<span class="msg">{r["msg"]}</span>'
-            f'</div>'
+            f"</div>"
         )
     container.markdown(
         f'<div class="hkn-log">{"".join(html_rows)}</div>',
@@ -672,8 +675,7 @@ def validate_inputs(in_path: str, out_path: str):
             errors.append(f"Input path is not a directory: `{p}`")
         elif not list_images(p):
             errors.append(
-                f"No supported images found in `{p}` "
-                f"(accepted: {', '.join(sorted(VALID_EXT))})."
+                f"No supported images found in `{p}` (accepted: {', '.join(sorted(VALID_EXT))})."
             )
     return errors
 
@@ -773,9 +775,9 @@ def main():
         push_log(
             "info",
             f'Matting model · <span class="path">{html.escape(model_name)}</span>'
-            f' · full-res, no supersample · '
+            f" · full-res, no supersample · "
             f'<span class="path">{max_workers}</span> worker(s) · '
-            f'resume {"on" if skip_existing else "off"}',
+            f"resume {'on' if skip_existing else 'off'}",
         )
 
         bgs: List[tuple] = []
@@ -784,14 +786,14 @@ def main():
                 bgs.append((f.name, f.getvalue()))
             push_log(
                 "info",
-                f'{len(bgs)} background(s) loaded: '
+                f"{len(bgs)} background(s) loaded: "
                 f'<span class="dim">{html.escape(", ".join(f.name for f in uploads))}</span>',
             )
         else:
             push_log(
                 "info",
                 'No backgrounds supplied — <span class="dim">transparent _nobg.png '
-                'will be produced, no composites.</span>',
+                "will be produced, no composites.</span>",
             )
 
         ok_count = 0
@@ -841,15 +843,14 @@ def main():
             compose_s = stages.get("composite", 0.0)
             other_s = max(
                 0.0,
-                r.elapsed_s - matting_s - compose_s
-                - stages.get("save_png", 0.0),
+                r.elapsed_s - matting_s - compose_s - stages.get("save_png", 0.0),
             )
             time_tag = (
                 f'<span class="dim"> · '
-                f'<b>{fmt_secs(r.elapsed_s)}</b> total · '
-                f'matting {fmt_secs(matting_s)} · '
-                f'composite {fmt_secs(compose_s)} · '
-                f'other {fmt_secs(other_s)}</span>'
+                f"<b>{fmt_secs(r.elapsed_s)}</b> total · "
+                f"matting {fmt_secs(matting_s)} · "
+                f"composite {fmt_secs(compose_s)} · "
+                f"other {fmt_secs(other_s)}</span>"
             )
 
             if getattr(r, "skipped", False):
@@ -857,7 +858,8 @@ def main():
                 ok_count += 1  # skipped items still count as "done ok"
                 produced = (
                     f' <span class="dim">→ {html.escape(", ".join(r.produced))}</span>'
-                    if r.produced else ""
+                    if r.produced
+                    else ""
                 )
                 push_log(
                     "info",
@@ -868,28 +870,26 @@ def main():
                 ok_count += 1
                 produced = (
                     f' <span class="dim">→ {html.escape(", ".join(r.produced))}</span>'
-                    if r.produced else ""
+                    if r.produced
+                    else ""
                 )
                 push_log(
                     "ok",
                     f'<span class="path">{html.escape(r.filename)}</span> '
-                    f'· {html.escape(r.detail)}{produced}{time_tag}',
+                    f"· {html.escape(r.detail)}{produced}{time_tag}",
                 )
             else:
                 err_count += 1
                 push_log(
                     "err",
                     f'<span class="path">{html.escape(r.filename)}</span> '
-                    f'· {html.escape(r.detail)}'
+                    f"· {html.escape(r.detail)}"
                     f'<span class="dim"> · {fmt_secs(r.elapsed_s)}</span>',
                 )
 
             frac = finished_count / max(r.total, 1)
             progress_bar.progress(min(frac, 1.0))
-            eta_str = (
-                f' · ETA {fmt_secs(remaining)}'
-                if finished_count < r.total else ''
-            )
+            eta_str = f" · ETA {fmt_secs(remaining)}" if finished_count < r.total else ""
             status_slot.markdown(
                 f"""
                 <div class="hkn-status">
@@ -921,26 +921,22 @@ def main():
             worked = max(0, (ok_count + err_count) - skip_count)
             avg_all = (total_elapsed / worked) if worked else 0.0
             skipped_tag = (
-                f' · <span class="dim">{skip_count} skipped (cached)</span>'
-                if skip_count else ''
+                f' · <span class="dim">{skip_count} skipped (cached)</span>' if skip_count else ""
             )
             push_log(
                 "info",
                 f'Run complete · <span class="path">{ok_count} ok</span> · '
-                f'{err_count} error(s){skipped_tag} · '
-                f'wall <b>{fmt_secs(wall)}</b> · '
-                f'avg <b>{fmt_secs(avg_all)}</b>/img'
+                f"{err_count} error(s){skipped_tag} · "
+                f"wall <b>{fmt_secs(wall)}</b> · "
+                f"avg <b>{fmt_secs(avg_all)}</b>/img"
                 + (
-                    f' · warm-up '
-                    f'{fmt_secs(st.session_state.get("_warmup_secs", 0.0))}'
+                    f" · warm-up {fmt_secs(st.session_state.get('_warmup_secs', 0.0))}"
                     if st.session_state.get("_warmup_secs")
                     else ""
                 ),
             )
             progress_bar.progress(1.0)
-            skipped_status = (
-                f", {skip_count} cached" if skip_count else ""
-            )
+            skipped_status = f", {skip_count} cached" if skip_count else ""
             status_slot.markdown(
                 f"""
                 <div class="hkn-status">
