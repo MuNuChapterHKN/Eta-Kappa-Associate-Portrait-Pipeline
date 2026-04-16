@@ -229,6 +229,7 @@ def _init_state() -> None:
     st.session_state.setdefault("models_ready_for", None)  # which model was warmed
     st.session_state.setdefault("high_quality", False)
     st.session_state.setdefault("max_workers", DEFAULT_WORKERS)
+    st.session_state.setdefault("skip_existing", True)
     # key used by the file_uploader — bump to reset it (Streamlit pattern)
     st.session_state.setdefault("_bg_uploader_key", 0)
 
@@ -461,14 +462,14 @@ def render_sidebar():
 
     # ---- PARALLELISM ------------------------------------------------------
     st.sidebar.markdown(
-        '<div class="hkn-side-label"><span class="idx">005 ·</span> Parallelism</div>',
+        '<div class="hkn-side-label"><span class="idx">005 ·</span> Parallelism &amp; resume</div>',
         unsafe_allow_html=True,
     )
     st.sidebar.markdown(
         '<div class="hkn-side-hint">Workers processing images in parallel. '
         '2 is a safe default: one in ANE/GPU inference while another is in '
-        'CPU matting. More helps on bigger machines but each worker adds '
-        '~1–2&nbsp;GB of memory pressure per 24&nbsp;MP image.</div>',
+        'CPU matting. Each worker can peak at 3–5&nbsp;GB on a 24&nbsp;MP '
+        'input, so the cap is tuned to your machine\'s CPU and RAM.</div>',
         unsafe_allow_html=True,
     )
     st.sidebar.number_input(
@@ -478,8 +479,25 @@ def render_sidebar():
         step=1,
         key="max_workers",
         help=(
-            "1 = sequential (legacy behaviour). "
-            f"Recommended upper bound on this machine: {MAX_RECOMMENDED_WORKERS}."
+            "1 = sequential. Recommended upper bound on this machine: "
+            f"{MAX_RECOMMENDED_WORKERS} (based on CPU cores and RAM). Higher "
+            "values can trigger the OS out-of-memory killer mid-batch."
+        ),
+    )
+    st.sidebar.markdown(
+        '<div class="hkn-side-hint">Resume skips any input whose outputs '
+        '(archival PNG + every current background composite) are already '
+        'on disk. Matching is by filename only — rename, delete, or change '
+        'backgrounds to force reprocessing.</div>',
+        unsafe_allow_html=True,
+    )
+    st.sidebar.checkbox(
+        "Resume · skip already processed",
+        key="skip_existing",
+        help=(
+            "Off = always reprocess every file, overwriting any existing "
+            "output. On = if {stem}_nobg.png and every "
+            "{stem}_bg_{bgname}_{AR}.jpg exist, skip the image entirely."
         ),
     )
 
@@ -733,6 +751,7 @@ def main():
         high_quality = bool(st.session_state.get("high_quality"))
         model_name = HIGH_QUALITY_MODEL if high_quality else DEFAULT_MODEL
         max_workers = int(st.session_state.get("max_workers") or DEFAULT_WORKERS)
+        skip_existing = bool(st.session_state.get("skip_existing", True))
 
         # ---- warm-up with live status ------------------------------------
         try:
@@ -755,7 +774,8 @@ def main():
             "info",
             f'Matting model · <span class="path">{html.escape(model_name)}</span>'
             f' · full-res, no supersample · '
-            f'<span class="path">{max_workers}</span> worker(s)',
+            f'<span class="path">{max_workers}</span> worker(s) · '
+            f'resume {"on" if skip_existing else "off"}',
         )
 
         bgs: List[tuple] = []
@@ -776,14 +796,16 @@ def main():
 
         ok_count = 0
         err_count = 0
+        skip_count = 0
         finished_count = 0
         total_elapsed = 0.0
         batch_t0 = time.perf_counter()
         progress_bar = progress_slot.progress(0.0)
 
         def on_start(idx: int, total: int, filename: str):
-            # In parallel mode several images are in flight at once; keep the
-            # start log minimal so the stream stays coherent.
+            # Only fires in the sequential path (workers == 1); in parallel
+            # mode the pipeline suppresses start callbacks because they'd
+            # be invoked from worker threads (ScriptRunContext warnings).
             push_log(
                 "info",
                 f'Starting <span class="path">{html.escape(filename)}</span> '
@@ -792,7 +814,8 @@ def main():
             render_log(log_slot)
 
         def on_progress(r: ItemResult):
-            nonlocal ok_count, err_count, finished_count, total_elapsed
+            nonlocal ok_count, err_count, skip_count
+            nonlocal finished_count, total_elapsed
             if r.index == 0:
                 push_log("err", html.escape(r.detail))
                 render_log(log_slot)
@@ -803,7 +826,12 @@ def main():
             # than the input-order index of the last finisher.
             finished_count += 1
             total_elapsed += r.elapsed_s
-            avg = total_elapsed / max(finished_count, 1)
+
+            # ETA uses only the time spent on *actually processed* items;
+            # skipped items contribute zero elapsed_s and would otherwise
+            # drag the running average to zero on resumed runs.
+            worked = finished_count - skip_count
+            avg = (total_elapsed / worked) if worked > 0 else 0.0
             remaining = (r.total - finished_count) * avg
 
             # Compact stage breakdown: matting is the heavy one, worth
@@ -824,7 +852,19 @@ def main():
                 f'other {fmt_secs(other_s)}</span>'
             )
 
-            if r.ok:
+            if getattr(r, "skipped", False):
+                skip_count += 1
+                ok_count += 1  # skipped items still count as "done ok"
+                produced = (
+                    f' <span class="dim">→ {html.escape(", ".join(r.produced))}</span>'
+                    if r.produced else ""
+                )
+                push_log(
+                    "info",
+                    f'<span class="path">{html.escape(r.filename)}</span> '
+                    f'· <span class="dim">cached · skipped</span>{produced}',
+                )
+            elif r.ok:
                 ok_count += 1
                 produced = (
                     f' <span class="dim">→ {html.escape(", ".join(r.produced))}</span>'
@@ -875,14 +915,19 @@ def main():
                 on_start=on_start,
                 model_name=model_name,
                 max_workers=max_workers,
+                skip_existing=skip_existing,
             )
             wall = time.perf_counter() - batch_t0
-            processed = ok_count + err_count
-            avg_all = (total_elapsed / processed) if processed else 0.0
+            worked = max(0, (ok_count + err_count) - skip_count)
+            avg_all = (total_elapsed / worked) if worked else 0.0
+            skipped_tag = (
+                f' · <span class="dim">{skip_count} skipped (cached)</span>'
+                if skip_count else ''
+            )
             push_log(
                 "info",
                 f'Run complete · <span class="path">{ok_count} ok</span> · '
-                f'{err_count} error(s) · '
+                f'{err_count} error(s){skipped_tag} · '
                 f'wall <b>{fmt_secs(wall)}</b> · '
                 f'avg <b>{fmt_secs(avg_all)}</b>/img'
                 + (
@@ -893,11 +938,14 @@ def main():
                 ),
             )
             progress_bar.progress(1.0)
+            skipped_status = (
+                f", {skip_count} cached" if skip_count else ""
+            )
             status_slot.markdown(
                 f"""
                 <div class="hkn-status">
                     <span class="label">Status</span>
-                    <span class="value">Complete · {ok_count} processed, {err_count} failed
+                    <span class="value">Complete · {ok_count} ok, {err_count} failed{skipped_status}
                         <span class="dim"> · {fmt_secs(wall)} total · {fmt_secs(avg_all)}/img</span></span>
                     <span class="count">100%</span>
                 </div>

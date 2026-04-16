@@ -57,7 +57,7 @@ On subsequent runs it skips the install if `requirements.txt` hasn't changed (SH
 
 ## Using the UI
 
-The sidebar is split into five labeled sections:
+The sidebar is split into six labeled sections:
 
 **001 · Source** — Click "Browse folder…" to pick the folder with raw portraits. On macOS the native Finder dialog opens via AppleScript. On other platforms a tkinter dialog runs in a subprocess (to avoid Streamlit's threading restrictions).
 
@@ -69,7 +69,9 @@ The sidebar is split into five labeled sections:
 - **Standard**: `isnet-general-use`, ~175 MB, fast. Uses CoreML on macOS for 3–6× acceleration.
 - **High Quality**: `birefnet-portrait`, ~970 MB, slower. Runs on CPU (transformer ops cause CoreML graph compilation hangs, so it's hardcoded to CPU).
 
-**005 · Execute** — "Begin processing" validates inputs, warms up models if needed (live progress), then runs the batch. The console shows per-image timing with a breakdown: matting time, composite time, and a running ETA.
+**005 · Parallelism & resume** — `Workers` chooses how many images process in parallel (default 2; UI cap auto-tuned from CPU cores and installed RAM, with a hard ceiling of 4 to keep peak memory bounded). `Resume · skip already processed` (on by default) short-circuits any input whose output files already exist on disk — useful when a long batch is interrupted. Matching is purely by filename: `{stem}_nobg.png` plus `{stem}_bg_{bgname}_{AR}.jpg` for every current background.
+
+**006 · Execute** — "Begin processing" validates inputs, warms up models if needed (live progress), then runs the batch. The console shows per-image timing with a breakdown: matting time, composite time, and a running ETA.
 
 ---
 

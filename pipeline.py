@@ -100,11 +100,44 @@ PORTRAIT_FACE_TOP_RATIO = FACE_TOP_RATIO  # backward-compat alias
 # Parallelism. Default to 2 workers: one in ANE/GPU inference while another
 # is in pymatting on the CPU, typically 1.5–2× faster than sequential with
 # minimal memory pressure. More helps only on beefy machines — each worker
-# allocates ~1–2 GB of scratch on a 24 MP input, so 4 workers ≈ 4–8 GB.
-# Upper bound is conservative (half the reported cores) to leave room for
-# the OS, the browser running the UI, and model intermediates.
+# can peak at ~3–5 GB of scratch on a 24 MP input (raw BGR + pymatting
+# float64 intermediates + decontam + bilateral + RGBA output), so 4 workers
+# can legitimately touch ~20 GB. We cap conservatively to avoid the OS
+# oom-killer silently nuking the process mid-batch.
 DEFAULT_WORKERS = 2
-MAX_RECOMMENDED_WORKERS = max(2, (os.cpu_count() or 2) // 2)
+
+
+def _detect_total_ram_gb() -> Optional[float]:
+    """Return total installed RAM in GB, or None if unavailable.
+
+    Uses POSIX sysconf when available (macOS + Linux). No psutil dependency.
+    """
+    try:
+        if hasattr(os, "sysconf") and "SC_PHYS_PAGES" in os.sysconf_names:
+            pages = os.sysconf("SC_PHYS_PAGES")
+            page_size = os.sysconf("SC_PAGE_SIZE")
+            return pages * page_size / (1024 ** 3)
+    except Exception:
+        pass
+    return None
+
+
+def _recommended_worker_cap() -> int:
+    """Compute a safe upper bound for parallel workers on this machine.
+
+    Heuristic: min(cpu_count // 4, ram_gb // 8, 4). Floors at 2. This keeps
+    a 12-core / 32 GB Apple Silicon at 3 workers, a 16-core / 64 GB at 4,
+    and a 10-core / 16 GB base-config Mac at 2. The hard ceiling of 4 is
+    intentional — beyond 4 the ANE/GPU saturates and extra workers just
+    eat RAM for no throughput gain.
+    """
+    cpu_cap = max(2, (os.cpu_count() or 2) // 4)
+    ram_gb = _detect_total_ram_gb()
+    ram_cap = max(2, int(ram_gb // 8)) if ram_gb else 3
+    return max(2, min(cpu_cap, ram_cap, 4))
+
+
+MAX_RECOMMENDED_WORKERS = _recommended_worker_cap()
 
 # Alpha threshold (0-255) for deciding which pixels belong to the subject
 # when computing the bounding box for canvas sizing. 12 ≈ 5% opacity: low
@@ -707,10 +740,42 @@ class ItemResult:
     # Fine-grained timing of the pipeline stages for this image. Keys:
     # "decode", "face", "crop", "matting", "save_png", "composite".
     stage_times: dict = field(default_factory=dict)
+    # True when the item was short-circuited because the expected output
+    # files already existed on disk (resume path). ok is also True in that
+    # case and ``produced`` carries the *pre-existing* output filenames.
+    skipped: bool = False
 
 
 ProgressFn = Callable[[ItemResult], None]
 StartFn = Callable[[int, int, str], None]
+
+
+def _expected_outputs(
+    img_path: Path,
+    bg_items: List[Tuple[str, "object", float, str]],
+) -> List[str]:
+    """Return the exact filenames ``_process_one_image`` would emit for
+    this input, given the current background set.
+
+    Used by the resume path: if every one of these files is already on
+    disk in the output directory, we skip the image entirely.
+    """
+    names = [f"{img_path.stem}_nobg.png"]
+    for bg_stem, _bg_pil, _bg_ar, bg_ar_tag in bg_items:
+        names.append(f"{img_path.stem}_bg_{bg_stem}_{bg_ar_tag}.jpg")
+    return names
+
+
+def _all_outputs_present(
+    img_path: Path,
+    bg_items: List[Tuple[str, "object", float, str]],
+    output_dir: Path,
+) -> bool:
+    """True iff every expected output for ``img_path`` already exists."""
+    return all(
+        (output_dir / name).exists() and (output_dir / name).stat().st_size > 0
+        for name in _expected_outputs(img_path, bg_items)
+    )
 
 
 def _process_one_image(
@@ -805,6 +870,7 @@ def process_batch(
     model_name: str = DEFAULT_MODEL,
     on_start: Optional[StartFn] = None,
     max_workers: int = 1,
+    skip_existing: bool = True,
 ) -> List[ItemResult]:
     """
     Execute the full pipeline for every image in ``input_dir``.
@@ -816,9 +882,20 @@ def process_batch(
     scales. While one image is in pymatting on the CPU, another can be
     in ONNX inference on the ANE/Metal GPU.
 
-    Callbacks (``on_start``, ``on_progress``) are serialised with an
-    internal lock and fired from the main thread (the one that called
-    this function), so Streamlit state updates stay safe.
+    ``on_progress`` is always fired from the main thread (the one that
+    called ``process_batch``), so it's safe to call Streamlit APIs from
+    inside it. ``on_start`` is only fired in the **sequential** path
+    (``max_workers == 1``) — in parallel mode it would have to fire from
+    worker threads, which produces the "missing ScriptRunContext"
+    warnings and serves no useful purpose when multiple images are in
+    flight simultaneously.
+
+    When ``skip_existing`` is True (default) any input whose complete
+    output set is already on disk is short-circuited: no decode, no
+    matting, no composite. A synthetic ``ItemResult`` with
+    ``skipped=True`` is emitted for each so callers can show "N skipped"
+    stats. Matching is purely filename-based: ``{stem}_nobg.png`` plus
+    ``{stem}_bg_{bgstem}_{artag}.jpg`` for every current background.
     """
     from PIL import Image
 
@@ -848,13 +925,6 @@ def process_batch(
     total = len(images)
     results: List[ItemResult] = []
 
-    # Warm up the lazy singletons (rembg session, face detector) on the main
-    # thread *before* dispatching any work, so worker threads never race on
-    # their first-access init. Cheap if already cached by a prior prewarm().
-    if total > 0:
-        get_rembg_session(model_name)
-        get_face_detector()
-
     cb_lock = threading.Lock()
 
     def _fire_start(idx: int, filename: str) -> None:
@@ -875,11 +945,39 @@ def process_batch(
             except Exception:  # noqa: BLE001
                 pass
 
-    workers = max(1, min(int(max_workers), total or 1))
+    # --- Resume pass: partition inputs into "already done" vs "to process" ---
+    # This runs on the main thread before any heavy work, so Streamlit sees
+    # the skip log lines immediately.
+    to_process: List[Tuple[int, Path]] = []
+    for idx, img_path in enumerate(images, start=1):
+        if skip_existing and _all_outputs_present(img_path, bg_items, output_dir):
+            outs = _expected_outputs(img_path, bg_items)
+            skip_res = ItemResult(
+                idx, total, img_path.name, True,
+                "already processed · skipped",
+                outs,
+                elapsed_s=0.0,
+                stage_times={},
+                skipped=True,
+            )
+            results.append(skip_res)
+            _fire_progress(skip_res)
+        else:
+            to_process.append((idx, img_path))
+
+    # Warm up the lazy singletons only if we actually have work to do. If the
+    # whole batch was cached (resume on identical inputs) we skip the ~2 s
+    # model load entirely.
+    if to_process:
+        get_rembg_session(model_name)
+        get_face_detector()
+
+    workers = max(1, min(int(max_workers), len(to_process) or 1))
 
     if workers <= 1:
-        # Sequential path — preserves exact legacy semantics.
-        for idx, img_path in enumerate(images, start=1):
+        # Sequential path — preserves exact legacy semantics, including
+        # on_start callbacks (safe because we're on the main thread).
+        for idx, img_path in to_process:
             _fire_start(idx, img_path.name)
             res = _process_one_image(
                 idx, total, img_path, output_dir, bg_items, model_name
@@ -887,8 +985,12 @@ def process_batch(
             results.append(res)
             _fire_progress(res)
     else:
+        # Parallel path: we deliberately do NOT fire on_start from workers.
+        # Streamlit APIs must be called from the main thread; firing from a
+        # worker triggers "missing ScriptRunContext" warnings and leaves the
+        # UI in an undefined state. on_progress is still fired here (main
+        # thread) as each future completes.
         def _run(idx: int, img_path: Path) -> ItemResult:
-            _fire_start(idx, img_path.name)
             return _process_one_image(
                 idx, total, img_path, output_dir, bg_items, model_name
             )
@@ -897,8 +999,7 @@ def process_batch(
             max_workers=workers, thread_name_prefix="hkn-worker"
         ) as ex:
             futures = {
-                ex.submit(_run, idx, p): (idx, p)
-                for idx, p in enumerate(images, start=1)
+                ex.submit(_run, idx, p): (idx, p) for idx, p in to_process
             }
             for fut in as_completed(futures):
                 idx, img_path = futures[fut]
@@ -912,9 +1013,9 @@ def process_batch(
                 results.append(res)
                 _fire_progress(res)
 
-        # Return results in original input order regardless of completion
-        # order — callers (and tests) expect stable ordering.
-        results.sort(key=lambda r: r.index)
+    # Return results in original input order regardless of completion
+    # order — callers (and tests) expect stable ordering.
+    results.sort(key=lambda r: r.index)
 
     if bg_errors and on_progress is not None:
         for msg in bg_errors:
