@@ -23,8 +23,10 @@ import streamlit as st
 # deferred inside pipeline.py functions so the app renders instantly.
 from pipeline import (
     DEFAULT_MODEL,
+    DEFAULT_WORKERS,
     HIGH_QUALITY_MODEL,
     ItemResult,
+    MAX_RECOMMENDED_WORKERS,
     VALID_EXT,
     list_images,
     prewarm,
@@ -226,6 +228,7 @@ def _init_state() -> None:
     st.session_state.setdefault("models_ready", False)
     st.session_state.setdefault("models_ready_for", None)  # which model was warmed
     st.session_state.setdefault("high_quality", False)
+    st.session_state.setdefault("max_workers", DEFAULT_WORKERS)
     # key used by the file_uploader — bump to reset it (Streamlit pattern)
     st.session_state.setdefault("_bg_uploader_key", 0)
 
@@ -456,9 +459,33 @@ def render_sidebar():
         help="Recommended for portraits with curly or fly-away hair.",
     )
 
+    # ---- PARALLELISM ------------------------------------------------------
+    st.sidebar.markdown(
+        '<div class="hkn-side-label"><span class="idx">005 ·</span> Parallelism</div>',
+        unsafe_allow_html=True,
+    )
+    st.sidebar.markdown(
+        '<div class="hkn-side-hint">Workers processing images in parallel. '
+        '2 is a safe default: one in ANE/GPU inference while another is in '
+        'CPU matting. More helps on bigger machines but each worker adds '
+        '~1–2&nbsp;GB of memory pressure per 24&nbsp;MP image.</div>',
+        unsafe_allow_html=True,
+    )
+    st.sidebar.number_input(
+        "Workers",
+        min_value=1,
+        max_value=max(MAX_RECOMMENDED_WORKERS, DEFAULT_WORKERS),
+        step=1,
+        key="max_workers",
+        help=(
+            "1 = sequential (legacy behaviour). "
+            f"Recommended upper bound on this machine: {MAX_RECOMMENDED_WORKERS}."
+        ),
+    )
+
     # ---- EXECUTE ----------------------------------------------------------
     st.sidebar.markdown(
-        '<div class="hkn-side-label"><span class="idx">005 ·</span> Execute</div>',
+        '<div class="hkn-side-label"><span class="idx">006 ·</span> Execute</div>',
         unsafe_allow_html=True,
     )
     start = st.sidebar.button(
@@ -705,6 +732,7 @@ def main():
 
         high_quality = bool(st.session_state.get("high_quality"))
         model_name = HIGH_QUALITY_MODEL if high_quality else DEFAULT_MODEL
+        max_workers = int(st.session_state.get("max_workers") or DEFAULT_WORKERS)
 
         # ---- warm-up with live status ------------------------------------
         try:
@@ -726,7 +754,8 @@ def main():
         push_log(
             "info",
             f'Matting model · <span class="path">{html.escape(model_name)}</span>'
-            f' · full-res, no supersample',
+            f' · full-res, no supersample · '
+            f'<span class="path">{max_workers}</span> worker(s)',
         )
 
         bgs: List[tuple] = []
@@ -747,22 +776,14 @@ def main():
 
         ok_count = 0
         err_count = 0
+        finished_count = 0
         total_elapsed = 0.0
         batch_t0 = time.perf_counter()
         progress_bar = progress_slot.progress(0.0)
 
         def on_start(idx: int, total: int, filename: str):
-            status_slot.markdown(
-                f"""
-                <div class="hkn-status">
-                    <span class="label">Processing</span>
-                    <span class="value">{idx} of {total} · {html.escape(filename)}
-                        <span class="dim"> · working…</span></span>
-                    <span class="count">{int((idx - 1) / max(total, 1) * 100):02d}%</span>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
+            # In parallel mode several images are in flight at once; keep the
+            # start log minimal so the stream stays coherent.
             push_log(
                 "info",
                 f'Starting <span class="path">{html.escape(filename)}</span> '
@@ -771,15 +792,19 @@ def main():
             render_log(log_slot)
 
         def on_progress(r: ItemResult):
-            nonlocal ok_count, err_count, total_elapsed
+            nonlocal ok_count, err_count, finished_count, total_elapsed
             if r.index == 0:
                 push_log("err", html.escape(r.detail))
                 render_log(log_slot)
                 return
 
+            # Completion order differs from dispatch order in parallel mode,
+            # so base the progress bar / ETA on "how many are done" rather
+            # than the input-order index of the last finisher.
+            finished_count += 1
             total_elapsed += r.elapsed_s
-            avg = total_elapsed / max(r.index, 1)
-            remaining = (r.total - r.index) * avg
+            avg = total_elapsed / max(finished_count, 1)
+            remaining = (r.total - finished_count) * avg
 
             # Compact stage breakdown: matting is the heavy one, worth
             # calling out. Others are in the tooltip-ish dim line.
@@ -819,16 +844,17 @@ def main():
                     f'<span class="dim"> · {fmt_secs(r.elapsed_s)}</span>',
                 )
 
-            frac = r.index / max(r.total, 1)
+            frac = finished_count / max(r.total, 1)
             progress_bar.progress(min(frac, 1.0))
             eta_str = (
-                f' · ETA {fmt_secs(remaining)}' if r.index < r.total else ''
+                f' · ETA {fmt_secs(remaining)}'
+                if finished_count < r.total else ''
             )
             status_slot.markdown(
                 f"""
                 <div class="hkn-status">
                     <span class="label">Processing</span>
-                    <span class="value">{r.index} of {r.total} · {html.escape(r.filename)}
+                    <span class="value">{finished_count} of {r.total} done · last · {html.escape(r.filename)}
                         <span class="dim"> · avg {fmt_secs(avg)}/img{eta_str}</span></span>
                     <span class="count">{int(frac * 100):02d}%</span>
                 </div>
@@ -837,7 +863,7 @@ def main():
             )
             stats_slot.empty()
             with stats_slot.container():
-                render_stats(r.total, r.index, ok_count, err_count)
+                render_stats(r.total, finished_count, ok_count, err_count)
             render_log(log_slot)
 
         try:
@@ -848,6 +874,7 @@ def main():
                 on_progress=on_progress,
                 on_start=on_start,
                 model_name=model_name,
+                max_workers=max_workers,
             )
             wall = time.perf_counter() - batch_t0
             processed = ok_count + err_count
