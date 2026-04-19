@@ -33,7 +33,16 @@ user actually clicks "Begin processing".
 
 from __future__ import annotations
 
+import io
 import os
+import platform
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+from fractions import Fraction
+from pathlib import Path
+from typing import Callable, List, Optional, Tuple
 
 
 # Numba's default "workqueue" threading layer is NOT re-entrant: when two
@@ -73,17 +82,7 @@ if _NUMBA_THREADSAFE_LAYER:
 # else: let numba pick the default ("workqueue") and we'll guard
 # pymatting calls with a lock instead — see _matting_lock below.
 
-import io
-import platform
-import threading
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
 _matting_lock = threading.Lock()
-from dataclasses import dataclass, field
-from fractions import Fraction
-from pathlib import Path
-from typing import Callable, List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
 # Configuration
