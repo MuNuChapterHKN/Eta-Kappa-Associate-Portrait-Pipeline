@@ -22,7 +22,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v4.37.3
+        uses: github/codeql-action/init@v4.37.9
         with:
           languages: python
           # security-extended: real security findings only.
@@ -31,6 +31,6 @@ jobs:
           queries: security-extended
 
       - name: Perform analysis
-        uses: github/codeql-action/analyze@v4.37.3
+        uses: github/codeql-action/analyze@v4.37.9
         with:
           category: "/language:python"
